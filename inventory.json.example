@@ -1,0 +1,73 @@
+{
+	"_comment": "列出你想在 /stack UI 中管理的 pi resources。id 可填 package source、npm package name、local package basename，或 top-level resource pattern；source 可選填，用於 id 只是短顯示名時指定實際 package/source；path 可選填，用於指定 package root 內的單一 resource path。",
+	"extensions": [
+		{
+			"id": "taskplane",
+			"label": "Taskplane",
+			"category": "Workflow:Orchestration",
+			"description": "Task orchestrator /orch"
+		},
+		{
+			"id": "@plannotator/pi-extension",
+			"label": "Plannotator",
+			"category": "Workflow:Review",
+			"description": "瀏覽器 annotation / review UI"
+		},
+		{
+			"id": "context-mode",
+			"label": "Context Mode",
+			"category": "Workflow:Analysis",
+			"description": "大輸出沙箱化；大量 logs / raw data 分析時開啟"
+		},
+		{
+			"id": "pi-subagents",
+			"label": "Pi Subagents",
+			"category": "Workflow:Orchestration",
+			"description": "subagent orchestration；/run /chain /parallel"
+		},
+		{
+			"id": "pi-lens",
+			"label": "Pi Lens",
+			"category": "Workflow:Code Intelligence",
+			"description": "LSP diagnostics/navigation & ast-grep tools"
+		}
+	],
+	"skills": [
+		{
+			"id": "create-taskplane-task",
+			"label": "Create Taskplane Task",
+			"source": "taskplane",
+			"path": "skills/create-taskplane-task/SKILL.md",
+			"category": "Workflow:Orchestration"
+		},
+		{
+			"id": "pi-subagents",
+			"label": "Pi Subagents Skill",
+			"source": "pi-subagents",
+			"path": "skills/pi-subagents/SKILL.md",
+			"category": "Workflow:Orchestration"
+		},
+		{
+			"id": "ast-grep",
+			"label": "ast-grep",
+			"source": "pi-lens",
+			"path": "skills/ast-grep/SKILL.md",
+			"category": "Workflow:Code Intelligence"
+		},
+		{
+			"id": "lsp-navigation",
+			"label": "LSP Navigation",
+			"source": "pi-lens",
+			"path": "skills/lsp-navigation/SKILL.md",
+			"category": "Workflow:Code Intelligence"
+		}
+	],
+	"prompts": [
+		{
+			"id": "pi-subagents-prompts",
+			"label": "Pi Subagents Prompts",
+			"source": "pi-subagents",
+			"category": "Workflow:Orchestration"
+		}
+	]
+}
