@@ -41,12 +41,26 @@ pi install git:github.com/yenhunghuang/pi-stack-switch -l
 pi -e git:github.com/yenhunghuang/pi-stack-switch
 ```
 
-### 後續更新
-當此套件有新版本推出時，你只需執行：
+### 後續更新與套用
+
+當此套件有新版本推出時，你可以透過以下兩步快速更新並在當前對話中套用：
+
+#### 1. 下載最新版本 (在終端機中執行)
 ```bash
 pi update --extensions
 ```
-`pi` 就會自動幫你下載最新版！
+`pi` 就會自動幫你下載最新版本的套件！
+
+#### 2. 在當前會話中立即套用 (在 Pi 的 TUI 對話框中輸入)
+不用關閉與重啟 Pi 軟體，直接在對話框中輸入以下斜線指令即可完成熱重載（Hot-Reload）：
+```text
+/reload
+```
+或
+```text
+/reload-runtime
+```
+這會使 Pi 重新載入最新版本 `pi-stack-switch` 的 Extension 實作，即刻享受全新的功能與視覺改良！
 
 ---
 
