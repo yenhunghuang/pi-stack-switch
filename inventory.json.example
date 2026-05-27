@@ -1,35 +1,35 @@
 {
-	"_comment": "列出你想在 /stack UI 中管理的 pi resources。id 可填 package source、npm package name、local package basename，或 top-level resource pattern；source 可選填，用於 id 只是短顯示名時指定實際 package/source；path 可選填，用於指定 package root 內的單一 resource path。",
+	"_comment": "列出你想在 /stack UI 中管理的 pi resources。id 可填 package source、npm package name、local package basename，或 top-level resource pattern；source 可選填，用於 id 只是短顯示名時指定實際 package/source；path 可選填，用於指定 package root 內的單一 resource path。standalone Skills/Prompts/Themes 不需 source，path 可用絕對檔案路徑。",
 	"extensions": [
 		{
 			"id": "taskplane",
 			"label": "Taskplane",
 			"category": "Workflow:Orchestration",
-			"description": "Task orchestrator /orch"
+			"description": "任務編排 /orch"
 		},
 		{
 			"id": "@plannotator/pi-extension",
 			"label": "Plannotator",
 			"category": "Workflow:Review",
-			"description": "瀏覽器 annotation / review UI"
+			"description": "標記 / review"
 		},
 		{
 			"id": "context-mode",
 			"label": "Context Mode",
 			"category": "Workflow:Analysis",
-			"description": "大輸出沙箱化；大量 logs / raw data 分析時開啟"
+			"description": "大輸出分析"
 		},
 		{
 			"id": "pi-subagents",
 			"label": "Pi Subagents",
 			"category": "Workflow:Orchestration",
-			"description": "subagent orchestration；/run /chain /parallel"
+			"description": "多 Agent 協同"
 		},
 		{
 			"id": "pi-lens",
 			"label": "Pi Lens",
 			"category": "Workflow:Code Intelligence",
-			"description": "LSP diagnostics/navigation & ast-grep tools"
+			"description": "LSP / AST 搜尋"
 		}
 	],
 	"skills": [
@@ -60,6 +60,13 @@
 			"source": "pi-lens",
 			"path": "skills/lsp-navigation/SKILL.md",
 			"category": "Workflow:Code Intelligence"
+		},
+		{
+			"id": "ai-sdk",
+			"label": "AI SDK",
+			"path": "/home/you/.agents/skills/ai-sdk/SKILL.md",
+			"category": "Standalone",
+			"description": "AI SDK helper"
 		}
 	],
 	"prompts": [

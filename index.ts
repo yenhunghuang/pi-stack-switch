@@ -15,17 +15,22 @@
 
 import { promises as fs } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, join, relative, resolve } from "node:path";
 import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
+	Theme,
 } from "@mariozechner/pi-coding-agent";
 import { getSettingsListTheme } from "@mariozechner/pi-coding-agent";
 import {
 	Container,
+	Input,
+	matchesKey,
 	type SettingItem,
 	SettingsList,
 	Text,
+	truncateToWidth,
+	visibleWidth,
 } from "@mariozechner/pi-tui";
 
 const GLOBAL_PI_DIR = join(homedir(), ".pi", "agent");
@@ -33,6 +38,16 @@ const STATUS_KEY = "stack-switch";
 const SELF_IDS = ["pi-stack-switch", "@your-org/pi-stack-switch"];
 
 type ResourceType = "extensions" | "skills" | "prompts" | "themes";
+type ChildResourceType = Exclude<ResourceType, "extensions">;
+
+const TABS = [
+	{ type: "extensions", label: "Extensions", shortcut: "1" },
+	{ type: "skills", label: "Skills", shortcut: "2" },
+	{ type: "prompts", label: "Prompts", shortcut: "3" },
+	{ type: "themes", label: "Themes", shortcut: "4" },
+] as const;
+
+type TabType = (typeof TABS)[number]["type"];
 
 interface PackageFilter {
 	source: string;
@@ -56,6 +71,10 @@ interface InventoryItem {
 	source?: string;
 	/** Optional resource path relative to package root or top-level .pi/agent dir. */
 	path?: string;
+	/** Optional code resources that should be toggled together with this item. */
+	associatedResources?: {
+		extensions?: string[];
+	};
 }
 
 interface Inventory {
@@ -387,6 +406,90 @@ function stripPatternPrefix(pattern: string): string {
 		: pattern;
 }
 
+function normalizePackageResourcePath(pattern: string): string {
+	const stripped = stripPatternPrefix(pattern.trim());
+	return stripped.startsWith("./") ? stripped.slice(2) : stripped;
+}
+
+function associatedExtensionPaths(item: InventoryItem): string[] {
+	return Array.from(
+		new Set(
+			(item.associatedResources?.extensions ?? [])
+				.map(normalizePackageResourcePath)
+				.filter(Boolean),
+		),
+	);
+}
+
+function hasAssociatedIndexEntrypoint(item: InventoryItem): boolean {
+	return associatedExtensionPaths(item).some(
+		(path) => basename(path) === "index.ts",
+	);
+}
+
+function updateAssociatedExtensionPatterns(
+	patterns: string[] | undefined,
+	associatedPaths: string[],
+	enabled: boolean,
+): string[] | undefined {
+	let next = patterns ? [...patterns] : patterns;
+	const wasExplicitEmpty = patterns !== undefined && patterns.length === 0;
+
+	for (const associatedPath of associatedPaths) {
+		if (!associatedPath) continue;
+
+		if (next === undefined) {
+			if (!enabled) next = [`-${associatedPath}`];
+			continue;
+		}
+
+		// `extensions: []` already disables every extension. Do not loosen it while
+		// applying a child item's tandem toggle.
+		if (next.length === 0) continue;
+
+		if (enabled) {
+			next = next.filter((pattern) => {
+				if (normalizePackageResourcePath(pattern) !== associatedPath)
+					return true;
+				return !pattern.startsWith("-") && !pattern.startsWith("!");
+			});
+			continue;
+		}
+
+		next = next.filter(
+			(pattern) => normalizePackageResourcePath(pattern) !== associatedPath,
+		);
+		next.push(`-${associatedPath}`);
+	}
+
+	if (next === undefined) return undefined;
+	if (wasExplicitEmpty) return [];
+	const deduped = Array.from(new Set(next));
+	return deduped.length > 0 ? deduped : undefined;
+}
+
+function setAssociatedExtensionsEnabled(
+	pkg: PackageSpec,
+	item: InventoryItem,
+	enabled: boolean,
+): PackageSpec {
+	const associatedPaths = associatedExtensionPaths(item);
+	if (associatedPaths.length === 0) return pkg;
+
+	const next = toPackageFilter(pkg);
+	const updated = updateAssociatedExtensionPatterns(
+		next.extensions,
+		associatedPaths,
+		enabled,
+	);
+	if (updated === undefined) {
+		delete next.extensions;
+	} else {
+		next.extensions = updated;
+	}
+	return simplifyPackageFilter(next);
+}
+
 function itemResourcePattern(item: InventoryItem): string {
 	return stripPatternPrefix(item.path ?? item.source ?? item.id);
 }
@@ -424,12 +527,9 @@ function setPackageResourceEnabled(
 }
 
 function packagePathEnabled(patterns: string[], path: string): boolean {
-	const includes = patterns.filter(
-		(pattern) =>
-			!pattern.startsWith("+") &&
-			!pattern.startsWith("-") &&
-			!pattern.startsWith("!"),
-	);
+	const includes = patterns
+		.filter((pattern) => !pattern.startsWith("-") && !pattern.startsWith("!"))
+		.map(stripPatternPrefix);
 	let enabled = includes.length === 0 || includes.includes(path);
 	for (const pattern of patterns) {
 		if (stripPatternPrefix(pattern) !== path) continue;
@@ -660,19 +760,27 @@ async function discoverUnmanaged(
 	});
 }
 
+interface ApplyToggleOptions {
+	skipAssociatedResources?: boolean;
+}
+
 function applyToggleToPackageList(
 	packages: PackageSpec[] | undefined,
 	resourceType: ResourceType,
 	item: InventoryItem,
 	enabled: boolean,
 	baseDir: string,
+	options: ApplyToggleOptions = {},
 ): { packages: PackageSpec[] | undefined; matched: string[] } {
 	if (!packages) return { packages, matched: [] };
 	const matched: string[] = [];
 	const next = packages.map((pkg) => {
 		if (!packageMatchesItem(pkg, item, baseDir)) return pkg;
 		matched.push(packageSource(pkg));
-		return setPackageResourceEnabled(pkg, resourceType, item, enabled);
+		const updated = setPackageResourceEnabled(pkg, resourceType, item, enabled);
+		return options.skipAssociatedResources
+			? updated
+			: setAssociatedExtensionsEnabled(updated, item, enabled);
 	});
 	return { packages: next, matched };
 }
@@ -683,6 +791,7 @@ async function applyToggle(
 	resourceType: ResourceType,
 	item: InventoryItem,
 	enabled: boolean,
+	options: ApplyToggleOptions = {},
 ): Promise<ToggleResult> {
 	if (!enabled && isSelfItem(item)) {
 		return { matched: [], blocked: "pi-stack-switch cannot disable itself." };
@@ -695,6 +804,7 @@ async function applyToggle(
 		item,
 		enabled,
 		GLOBAL_PI_DIR,
+		options,
 	);
 	const projectResult = applyToggleToPackageList(
 		loaded.project.packages,
@@ -702,6 +812,7 @@ async function applyToggle(
 		item,
 		enabled,
 		projectPiDir(cwd),
+		options,
 	);
 
 	const matched = Array.from(
@@ -731,138 +842,433 @@ async function applyToggle(
 	return { matched, fallbackScope: inventoryScope };
 }
 
+type SettingItemMeta = { resourceType: ResourceType; item: InventoryItem };
+
+interface ParentRowMeta {
+	id: string;
+	tab: ChildResourceType;
+	parentId: string;
+	parentItem?: InventoryItem;
+}
+
+interface BuiltSettingItems {
+	items: SettingItem[];
+	meta: Map<string, SettingItemMeta>;
+	childrenByParent: Map<string, SettingItemMeta[]>;
+	parentRows: Map<string, ParentRowMeta>;
+}
+
+interface BuildSettingItemsOptions {
+	width?: number;
+	foldedParentRows?: ReadonlySet<string>;
+	searchActive?: boolean;
+}
+
+const STANDALONE_PARENT_ID = "standalone";
+
+function isTreeTab(tab: TabType): tab is ChildResourceType {
+	return tab !== "extensions";
+}
+
+function parentRowId(tab: ChildResourceType, parentId: string): string {
+	return `parent:${tab}:${encodeURIComponent(parentId)}`;
+}
+
+function parentExpanded(
+	rowId: string,
+	foldedParentRows: ReadonlySet<string>,
+	searchActive: boolean,
+): boolean {
+	// Empty fold state means every parent starts folded; selected rows in the set
+	// are expanded by user action. Search mode temporarily expands all rows.
+	return searchActive || foldedParentRows.has(rowId);
+}
+
+function normalizeSearchInput(
+	data: string,
+	currentQuery: string,
+): string | undefined {
+	if (currentQuery.length === 0 && data === "/") return undefined;
+	if (data.startsWith("\x1b")) return data;
+	const hasControlChars = [...data].some((ch) => {
+		const code = ch.charCodeAt(0);
+		return code < 32 || code === 0x7f || (code >= 0x80 && code <= 0x9f);
+	});
+	if (hasControlChars) return data;
+	const normalized = data.replace(/[\\/_-]+/g, "");
+	return normalized.length > 0 ? normalized : undefined;
+}
+
+function cloneEnabledState(state: EnabledState): EnabledState {
+	return {
+		extensions: new Set(state.extensions),
+		skills: new Set(state.skills),
+		prompts: new Set(state.prompts),
+		themes: new Set(state.themes),
+	};
+}
+
+function setEnabledState(
+	state: EnabledState,
+	resourceType: ResourceType,
+	itemId: string,
+	enabled: boolean,
+): void {
+	if (enabled) {
+		state[resourceType].add(itemId);
+		return;
+	}
+	state[resourceType].delete(itemId);
+}
+
+type SharedEntrypointChoice = "disable-main-extension" | "child-only";
+
+function findParentExtension(
+	inventory: Inventory,
+	item: InventoryItem,
+): InventoryItem | undefined {
+	if (!item.source) return undefined;
+	return (inventory.extensions ?? []).find(
+		(ext) => ext.id === item.source || ext.source === item.source,
+	);
+}
+
+function parentSourceKeys(
+	item: InventoryItem,
+	parent: InventoryItem | undefined,
+): Set<string> {
+	const keys = new Set<string>();
+	if (item.source) keys.add(item.source);
+	if (parent) {
+		keys.add(parent.id);
+		if (parent.source) keys.add(parent.source);
+	}
+	return keys;
+}
+
+function enabledSiblingResources(
+	inventory: Inventory,
+	state: EnabledState,
+	meta: SettingItemMeta,
+): SettingItemMeta[] {
+	const parent = findParentExtension(inventory, meta.item);
+	const keys = parentSourceKeys(meta.item, parent);
+	if (keys.size === 0) return [];
+
+	const siblings: SettingItemMeta[] = [];
+	for (const resourceType of ["skills", "prompts", "themes"] as const) {
+		for (const item of inventory[resourceType] ?? []) {
+			if (resourceType === meta.resourceType && item.id === meta.item.id) {
+				continue;
+			}
+			if (!item.source || !keys.has(item.source)) continue;
+			if (!state[resourceType].has(item.id)) continue;
+			siblings.push({ resourceType, item });
+		}
+	}
+	return siblings;
+}
+
+function shouldConfirmSharedEntrypointDisable(
+	inventory: Inventory,
+	state: EnabledState,
+	meta: SettingItemMeta,
+): boolean {
+	if (meta.resourceType === "extensions") return false;
+	if (!state[meta.resourceType].has(meta.item.id)) return false;
+	if (!hasAssociatedIndexEntrypoint(meta.item)) return false;
+	if (!findParentExtension(inventory, meta.item)) return false;
+	return enabledSiblingResources(inventory, state, meta).length > 0;
+}
+
+function createSharedEntrypointDialog(
+	theme: Theme,
+	item: InventoryItem,
+	parent: InventoryItem,
+	siblings: SettingItemMeta[],
+	onDone: (choice?: SharedEntrypointChoice) => void,
+) {
+	let selected = 0;
+	const options = [
+		{
+			choice: "disable-main-extension" as const,
+			title: "一併關閉主套件",
+			detail: "套件 JS 完全卸載",
+		},
+		{
+			choice: "child-only" as const,
+			title: `僅關閉 ${item.label}`,
+			detail: "保留程式背景運行",
+		},
+	];
+	const siblingLabels = siblings
+		.map((sibling) => sibling.item.label)
+		.slice(0, 4)
+		.join(", ");
+
+	return {
+		render: (width: number) => {
+			const lines = [
+				theme.fg("warning", theme.bold("⚠ 共享入口 index.ts 依賴警示")),
+				`「${item.label}」關聯到 ${parent.label} 的 index.ts。`,
+				`仍啟用的兄弟資源：${siblingLabels || "(none)"}`,
+				"",
+				"請選擇處理方式：",
+				...options.map((option, index) => {
+					const marker = index === selected ? "›" : " ";
+					const line = `${marker} ${index + 1}. ${option.title} — ${option.detail}`;
+					return index === selected
+						? theme.bg("selectedBg", theme.fg("accent", theme.bold(line)))
+						: theme.fg("muted", line);
+				}),
+				"",
+				theme.fg("dim", "↑↓/←→ 選擇 · 1/2 直接選 · Enter 確認 · Esc 取消"),
+			];
+			return lines.map((line) => truncateToWidth(line, width));
+		},
+		handleInput: (data: string) => {
+			if (
+				matchesKey(data, "up") ||
+				matchesKey(data, "left") ||
+				matchesKey(data, "shift+tab")
+			) {
+				selected = (selected + options.length - 1) % options.length;
+				return;
+			}
+			if (
+				matchesKey(data, "down") ||
+				matchesKey(data, "right") ||
+				matchesKey(data, "tab")
+			) {
+				selected = (selected + 1) % options.length;
+				return;
+			}
+			if (matchesKey(data, "1")) {
+				onDone(options[0]?.choice);
+				return;
+			}
+			if (matchesKey(data, "2")) {
+				onDone(options[1]?.choice);
+				return;
+			}
+			if (matchesKey(data, "enter") || data === " ") {
+				onDone(options[selected]?.choice);
+				return;
+			}
+			if (matchesKey(data, "escape")) {
+				onDone(undefined);
+			}
+		},
+		invalidate: () => {},
+	};
+}
+
 function buildSettingItems(
 	inventory: Inventory,
 	state: EnabledState,
-): {
-	items: SettingItem[];
-	meta: Map<string, { resourceType: ResourceType; item: InventoryItem }>;
-	childrenByParent: Map<string, Array<{ resourceType: ResourceType; item: InventoryItem }>>;
-} {
-	const items: SettingItem[] = [];
-	const meta = new Map<
-		string,
-		{ resourceType: ResourceType; item: InventoryItem }
-	>();
-
+	currentTab: TabType,
+	options: BuildSettingItemsOptions = {},
+): BuiltSettingItems {
+	const {
+		width = 80,
+		foldedParentRows = new Set<string>(),
+		searchActive = false,
+	} = options;
+	const meta = new Map<string, SettingItemMeta>();
 	const extensions = inventory.extensions ?? [];
-	const childrenByParent = new Map<string, Array<{ resourceType: ResourceType; item: InventoryItem }>>();
-	const orphans: Array<{ resourceType: ResourceType; item: InventoryItem }> = [];
+	const childrenByParent = new Map<string, SettingItemMeta[]>();
+	const parentByChild = new Map<InventoryItem, InventoryItem>();
+	const parentRows = new Map<string, ParentRowMeta>();
 
-	// Initialize children container for each extension
 	for (const ext of extensions) {
 		childrenByParent.set(ext.id, []);
 	}
 
-	// Classify child resources under their parents, or mark as orphans
 	for (const resourceType of ["skills", "prompts", "themes"] as const) {
-		const list = inventory[resourceType] ?? [];
-		for (const item of list) {
-			let foundParent = false;
-			if (item.source) {
-				const parent = extensions.find(
-					(ext) => ext.id === item.source || ext.source === item.source,
+		for (const item of inventory[resourceType] ?? []) {
+			const parent = item.source
+				? extensions.find(
+						(ext) => ext.id === item.source || ext.source === item.source,
+					)
+				: undefined;
+			const child = { resourceType, item };
+
+			if (parent) {
+				childrenByParent.get(parent.id)?.push(child);
+				parentByChild.set(item, parent);
+			}
+		}
+	}
+
+	interface PendingItem {
+		settingId: string;
+		rawLabel: string;
+		currentValue: string;
+		values: string[];
+		description?: string;
+	}
+	const pending: PendingItem[] = [];
+
+	const addDisplayItem = (
+		resourceType: ResourceType,
+		item: InventoryItem,
+		indent = false,
+	) => {
+		const settingId = `${resourceType}:${item.id}`;
+		const description = item.description ? ` — ${item.description}` : "";
+		const rawLabel = `${indent ? "  " : ""}${item.label}${description}`;
+		pending.push({
+			settingId,
+			rawLabel,
+			currentValue: state[resourceType].has(item.id) ? "on" : "off",
+			values: ["on", "off"],
+		});
+		meta.set(settingId, { resourceType, item });
+	};
+
+	const createItems = (pendingItems: PendingItem[]): SettingItem[] => {
+		// Calculate maximum label width based on terminal width to keep values aligned.
+		const maxLabelLimit = Math.max(30, width - 12);
+		const maxRawWidth =
+			pendingItems.length > 0
+				? Math.max(...pendingItems.map((p) => visibleWidth(p.rawLabel)))
+				: 0;
+		const targetWidth = Math.min(maxRawWidth, maxLabelLimit);
+
+		return pendingItems.map((p) => {
+			let displayLabel = p.rawLabel;
+			const descriptions: string[] = [];
+
+			if (visibleWidth(p.rawLabel) > targetWidth) {
+				displayLabel = truncateToWidth(p.rawLabel, targetWidth, "…");
+				descriptions.push(p.rawLabel);
+			} else if (visibleWidth(p.rawLabel) < targetWidth) {
+				displayLabel =
+					p.rawLabel + " ".repeat(targetWidth - visibleWidth(p.rawLabel));
+			}
+			if (p.description) descriptions.push(p.description);
+
+			return {
+				id: p.settingId,
+				label: displayLabel,
+				description: descriptions.length ? descriptions.join(" · ") : " ",
+				currentValue: p.currentValue,
+				values: p.values,
+			};
+		});
+	};
+
+	if (currentTab === "extensions") {
+		for (const ext of extensions) {
+			addDisplayItem("extensions", ext);
+		}
+
+		return {
+			items: createItems(pending),
+			meta,
+			childrenByParent,
+			parentRows,
+		};
+	}
+
+	if (isTreeTab(currentTab)) {
+		const groupedByParent = new Map<string, SettingItemMeta[]>();
+		const standaloneChildren: SettingItemMeta[] = [];
+
+		for (const item of inventory[currentTab] ?? []) {
+			const parent = parentByChild.get(item);
+			const child = { resourceType: currentTab, item };
+			if (!parent) {
+				standaloneChildren.push(child);
+				continue;
+			}
+			const group = groupedByParent.get(parent.id) ?? [];
+			group.push(child);
+			groupedByParent.set(parent.id, group);
+		}
+
+		const sortChildren = (children: SettingItemMeta[]) =>
+			[...children].sort((a, b) =>
+				a.item.label.localeCompare(b.item.label, "en", { sensitivity: "base" }),
+			);
+
+		const addParentGroup = (
+			parentId: string,
+			parentItem: InventoryItem | undefined,
+			children: SettingItemMeta[],
+		) => {
+			const rowId = parentRowId(currentTab, parentId);
+			const expanded = parentExpanded(rowId, foldedParentRows, searchActive);
+			const enabledCount = children.filter((child) =>
+				state[child.resourceType].has(child.item.id),
+			).length;
+			const summary = `${enabledCount}/${children.length} ON`;
+			const parentDisabledWarning =
+				parentItem !== undefined &&
+				!state.extensions.has(parentItem.id) &&
+				enabledCount > 0;
+			const currentValue = parentDisabledWarning ? `⚠ ${summary}` : summary;
+			const parentLabel = parentItem?.label ?? "Standalone";
+			const rawLabel = `${expanded ? "▾" : "▸"} ${parentLabel}`;
+			const descriptions: string[] = [];
+			if (parentDisabledWarning && parentItem) {
+				descriptions.push(
+					`${parentItem.label} extension is off. Enable it from Extensions tab.`,
 				);
-				if (parent) {
-					childrenByParent.get(parent.id)!.push({ resourceType, item });
-					foundParent = true;
-				}
 			}
-			if (!foundParent) {
-				orphans.push({ resourceType, item });
+			if (parentItem?.description) descriptions.push(parentItem.description);
+			if (!parentItem) {
+				descriptions.push(
+					"Standalone resources are not attached to an Extension.",
+				);
 			}
+
+			pending.push({
+				settingId: rowId,
+				rawLabel,
+				currentValue,
+				values: [currentValue],
+				description: descriptions.length ? descriptions.join("\n") : undefined,
+			});
+			parentRows.set(rowId, {
+				id: rowId,
+				tab: currentTab,
+				parentId,
+				parentItem,
+			});
+
+			if (!expanded) return;
+			for (const child of sortChildren(children)) {
+				addDisplayItem(child.resourceType, child.item, true);
+			}
+		};
+
+		for (const parent of extensions) {
+			const children = groupedByParent.get(parent.id);
+			if (!children?.length) continue;
+			addParentGroup(parent.id, parent, children);
+		}
+		if (standaloneChildren.length > 0) {
+			addParentGroup(STANDALONE_PARENT_ID, undefined, standaloneChildren);
 		}
 	}
 
-	const addItem = (
-		resourceType: ResourceType,
-		item: InventoryItem,
-		parentItem?: InventoryItem,
-		treePrefix?: string,
-	) => {
-		const settingId = `${resourceType}:${item.id}`;
-		const prefix = item.category ? `[${item.category}] ` : "";
-
-		let label = "";
-		if (parentItem) {
-			const isParentOn = state.extensions.has(parentItem.id);
-			const parentWarning = isParentOn ? "" : ` (⚠️ Requires ${parentItem.label})`;
-			label = `${treePrefix || "  ↳ "}${prefix}${item.label}${parentWarning}${item.description ? ` — ${item.description}` : ""}`;
-		} else {
-			label = `${prefix}${item.label}${item.description ? ` — ${item.description}` : ""}`;
-		}
-
-		items.push({
-			id: settingId,
-			label,
-			currentValue: state[resourceType].has(item.id) ? "on" : "off",
-			values: ["on", "off"],
-		});
-		meta.set(settingId, { resourceType, item });
+	return {
+		items: createItems(pending),
+		meta,
+		childrenByParent,
+		parentRows,
 	};
+}
 
-	const allCreatedItems: SettingItem[] = [];
-
-	const generateItem = (
-		resourceType: ResourceType,
-		item: InventoryItem,
-		parentItem?: InventoryItem,
-		treePrefix?: string,
-	) => {
-		const settingId = `${resourceType}:${item.id}`;
-		const prefix = item.category ? `[${item.category}] ` : "";
-
-		let label = "";
-		if (parentItem) {
-			const isParentOn = state.extensions.has(parentItem.id);
-			const parentWarning = isParentOn ? "" : ` (⚠️ Requires ${parentItem.label})`;
-			label = `${treePrefix || "  ↳ "}${prefix}${item.label}${parentWarning}${item.description ? ` — ${item.description}` : ""}`;
-		} else {
-			label = `${prefix}${item.label}${item.description ? ` — ${item.description}` : ""}`;
+function renderTabBar(currentTab: TabType, theme: Theme): string {
+	return TABS.map((tab) => {
+		const label = `${tab.shortcut} ${tab.label.toUpperCase()}`;
+		if (tab.type === currentTab) {
+			return theme.fg("accent", theme.bold(theme.underline(`══ ${label} ══`)));
 		}
-
-		allCreatedItems.push({
-			id: settingId,
-			label,
-			currentValue: state[resourceType].has(item.id) ? "on" : "off",
-			values: ["on", "off"],
-		});
-		meta.set(settingId, { resourceType, item });
-	};
-
-	// 1. Generate Extensions only (hide children for simplified view)
-	for (const ext of extensions) {
-		generateItem("extensions", ext);
-	}
-
-	// 2. Generate Orphan items
-	for (const { resourceType, item } of orphans) {
-		generateItem(resourceType, item);
-	}
-
-	// 依狀態分流（Enabled 啟用在上，Disabled 未啟用在下）
-	const enabledList = allCreatedItems.filter(x => x.currentValue === "on");
-	const disabledList = allCreatedItems.filter(x => x.currentValue === "off");
-
-	// 兩堆各自依 label 字母排序 (忽略大小寫與中英文順序)
-	enabledList.sort((a, b) => a.label.localeCompare(b.label, "en", { sensitivity: "base" }));
-	disabledList.sort((a, b) => a.label.localeCompare(b.label, "en", { sensitivity: "base" }));
-
-	// 組合 items，並在啟用與未啟用中間插入明顯的分隔線
-	items.push(...enabledList);
-
-	if (enabledList.length > 0 && disabledList.length > 0) {
-		items.push({
-			id: "separator:line",
-			label: "─── [ 已啟用 / Enabled ] ────────────────────────────── [ 未啟用 / Disabled ] ───",
-			currentValue: "",
-			values: [],
-		});
-	}
-
-	items.push(...disabledList);
-
-	return { items, meta, childrenByParent };
+		return theme.fg("muted", ` ${label} `);
+	}).join("  ");
 }
 
 async function openSelector(
@@ -870,9 +1276,19 @@ async function openSelector(
 	loadedInventory: LoadedInventory,
 ): Promise<{ toggles: number; blocked: string[]; fallbackWrites: string[] }> {
 	const initial = await readEnabled(ctx.cwd, loadedInventory.inventory);
-	const { items, meta, childrenByParent } = buildSettingItems(loadedInventory.inventory, initial);
+	const currentState = cloneEnabledState(initial);
+	let currentTab: TabType = "extensions";
+	let lastWidth = 80;
+	const foldedParentRows = new Set<string>();
+	let searchActive = false;
+	let view = buildSettingItems(
+		loadedInventory.inventory,
+		currentState,
+		currentTab,
+		{ width: lastWidth, foldedParentRows, searchActive },
+	);
 
-	if (!items.length) {
+	if (!view.items.length) {
 		ctx.ui.notify("inventory.json is empty.", "warning");
 		return { toggles: 0, blocked: [], fallbackWrites: [] };
 	}
@@ -885,12 +1301,18 @@ async function openSelector(
 
 	await ctx.ui.custom<undefined>((tui, theme, _kb, done) => {
 		const container = new Container();
+		const tabBar = new Text(renderTabBar(currentTab, theme), 1, 0);
+		container.addChild(tabBar);
+		container.addChild(new Text(theme.fg("muted", "─".repeat(72)), 1, 0));
 		container.addChild(
-			new Text(theme.fg("accent", theme.bold("Extension Stack")), 1, 1),
+			new Text(theme.fg("accent", theme.bold("Extension Stack")), 1, 0),
 		);
 		container.addChild(
 			new Text(
-				theme.fg("muted", "↑↓ navigate · ←→ toggle · / search · Esc close"),
+				theme.fg(
+					"muted",
+					"←→/Tab tabs · 1-4 tabs · ↑↓ navigate · Enter/Space toggle/fold · type to search · Esc close",
+				),
 				1,
 				0,
 			),
@@ -908,66 +1330,290 @@ async function openSelector(
 					return selected
 						? theme.bold(theme.fg("success", onText))
 						: theme.fg("success", onText);
-				} else {
+				}
+
+				if (text === "off") {
 					const offText = "○ OFF";
 					return selected
 						? theme.bold(theme.fg("muted", offText))
 						: theme.fg("muted", offText);
 				}
-			}
+
+				const summaryTone = text.startsWith("⚠") ? "warning" : "muted";
+				return selected
+					? theme.bold(theme.fg(summaryTone, text))
+					: theme.fg(summaryTone, text);
+			},
 		};
 
-		const list = new SettingsList(
-			items,
-			Math.min(items.length + 2, 18),
-			customSettingsTheme,
-			(settingId, newValue) => {
-				const m = meta.get(settingId);
-				if (!m) return;
-				toggles++;
-				writeQueue = writeQueue
-					.then(async () => {
-						const result = await applyToggle(
-							ctx.cwd,
-							loadedInventory.scope,
-							m.resourceType,
-							m.item,
-							newValue === "on",
-						);
-						if (result.blocked) blocked.push(result.blocked);
-						if (result.fallbackScope) {
-							fallbackWrites.push(`${m.item.id} (${result.fallbackScope})`);
-						}
+		let meta = view.meta;
+		let childrenByParent = view.childrenByParent;
+		let parentRows = view.parentRows;
+		let sharedEntrypointDialogOpen = false;
+		let searchMirror = new Input();
+		const sharedEntrypointChoices = new Map<string, SharedEntrypointChoice>();
 
-						// 父子綁定開關：若 toggle 的是 parent extension，則對其下所有子項目做相同狀態切換
-						if (m.resourceType === "extensions") {
-							const children = childrenByParent.get(m.item.id) ?? [];
+		const resetSearchState = () => {
+			searchMirror = new Input();
+			searchActive = false;
+		};
+
+		const updateSearchState = (data: string): boolean => {
+			const wasSearching = searchMirror.getValue().length > 0;
+			const sanitized = data.replace(/ /g, "");
+			if (!sanitized) return false;
+
+			searchMirror.handleInput(sanitized);
+			const isSearching = searchMirror.getValue().length > 0;
+			if (wasSearching === isSearching) return false;
+			searchActive = isSearching;
+			return true;
+		};
+
+		const createList = (nextItems: SettingItem[], selectedId?: string) => {
+			const itemsWithDialogs = nextItems.map((item) => {
+				const m = meta.get(item.id);
+				if (
+					!m ||
+					!shouldConfirmSharedEntrypointDisable(
+						loadedInventory.inventory,
+						currentState,
+						m,
+					)
+				) {
+					return item;
+				}
+
+				const parent = findParentExtension(loadedInventory.inventory, m.item);
+				if (!parent) return item;
+				const siblings = enabledSiblingResources(
+					loadedInventory.inventory,
+					currentState,
+					m,
+				);
+				return {
+					...item,
+					submenu: (
+						_currentValue: string,
+						submenuDone: (selectedValue?: string) => void,
+					) => {
+						sharedEntrypointDialogOpen = true;
+						return createSharedEntrypointDialog(
+							theme,
+							m.item,
+							parent,
+							siblings,
+							(choice) => {
+								sharedEntrypointDialogOpen = false;
+								if (choice) {
+									sharedEntrypointChoices.set(item.id, choice);
+									submenuDone("off");
+									return;
+								}
+								submenuDone(undefined);
+							},
+						);
+					},
+				};
+			});
+
+			const nextList = new SettingsList(
+				itemsWithDialogs,
+				Math.min(nextItems.length + 2, 18),
+				customSettingsTheme,
+				(settingId, newValue) => {
+					const parentRow = parentRows.get(settingId);
+					if (parentRow) {
+						if (foldedParentRows.has(parentRow.id)) {
+							foldedParentRows.delete(parentRow.id);
+						} else {
+							foldedParentRows.add(parentRow.id);
+						}
+						rebuildList(settingId);
+						tui.requestRender();
+						return;
+					}
+
+					const m = meta.get(settingId);
+					if (!m) return;
+					const enabled = newValue === "on";
+					const sharedChoice = sharedEntrypointChoices.get(settingId);
+					sharedEntrypointChoices.delete(settingId);
+					const parentToDisable =
+						!enabled && sharedChoice === "disable-main-extension"
+							? findParentExtension(loadedInventory.inventory, m.item)
+							: undefined;
+					const skipAssociatedResources =
+						!enabled && sharedChoice === "child-only";
+					const children =
+						m.resourceType === "extensions"
+							? (childrenByParent.get(m.item.id) ?? [])
+							: [];
+
+					setEnabledState(currentState, m.resourceType, m.item.id, enabled);
+					if (parentToDisable) {
+						setEnabledState(
+							currentState,
+							"extensions",
+							parentToDisable.id,
+							false,
+						);
+					}
+					for (const child of children) {
+						setEnabledState(
+							currentState,
+							child.resourceType,
+							child.item.id,
+							enabled,
+						);
+					}
+
+					toggles++;
+					rebuildList(settingId);
+					tui.requestRender();
+					writeQueue = writeQueue
+						.then(async () => {
+							const result = await applyToggle(
+								ctx.cwd,
+								loadedInventory.scope,
+								m.resourceType,
+								m.item,
+								enabled,
+								{ skipAssociatedResources },
+							);
+							if (result.blocked) blocked.push(result.blocked);
+							if (result.fallbackScope) {
+								fallbackWrites.push(`${m.item.id} (${result.fallbackScope})`);
+							}
+
+							// 父子綁定開關：若 toggle 的是 parent extension，則對其下所有子項目做相同狀態切換。
+							// Parent extension 已負責 extension filter，子項目同步時避免重寫 associatedResources。
 							for (const child of children) {
 								const childResult = await applyToggle(
 									ctx.cwd,
 									loadedInventory.scope,
 									child.resourceType,
 									child.item,
-									newValue === "on",
+									enabled,
+									{ skipAssociatedResources: true },
 								);
 								if (childResult.blocked) blocked.push(childResult.blocked);
 							}
-						}
-					})
-					.catch((err: Error) => {
-						writeErrors.push(err);
-					});
-			},
-			() => done(undefined),
-			{ enableSearch: true },
-		);
+
+							if (parentToDisable) {
+								const parentResult = await applyToggle(
+									ctx.cwd,
+									loadedInventory.scope,
+									"extensions",
+									parentToDisable,
+									false,
+									{ skipAssociatedResources: true },
+								);
+								if (parentResult.blocked) blocked.push(parentResult.blocked);
+								if (parentResult.fallbackScope) {
+									fallbackWrites.push(
+										`${parentToDisable.id} (${parentResult.fallbackScope})`,
+									);
+								}
+							}
+						})
+						.catch((err: Error) => {
+							writeErrors.push(err);
+						});
+				},
+				() => done(undefined),
+				{ enableSearch: true },
+			);
+
+			const selectedIndex = selectedId
+				? nextItems.findIndex((item) => item.id === selectedId)
+				: -1;
+			if (selectedIndex >= 0) {
+				(nextList as unknown as { selectedIndex: number }).selectedIndex =
+					selectedIndex;
+			}
+			return nextList;
+		};
+
+		let list = createList(view.items);
 		container.addChild(list);
 
+		const rebuildList = (selectedId?: string) => {
+			view = buildSettingItems(
+				loadedInventory.inventory,
+				currentState,
+				currentTab,
+				{ width: lastWidth, foldedParentRows, searchActive },
+			);
+			meta = view.meta;
+			childrenByParent = view.childrenByParent;
+			parentRows = view.parentRows;
+			container.removeChild(list);
+			list = createList(view.items, selectedId);
+			container.addChild(list);
+			container.invalidate();
+		};
+
+		const switchToTab = (nextTab: TabType) => {
+			if (nextTab === currentTab) return;
+			currentTab = nextTab;
+			resetSearchState();
+			tabBar.setText(renderTabBar(currentTab, theme));
+			rebuildList();
+			tui.requestRender();
+		};
+
+		const cycleTab = (direction: 1 | -1) => {
+			const currentIndex = TABS.findIndex((tab) => tab.type === currentTab);
+			const nextIndex = (currentIndex + direction + TABS.length) % TABS.length;
+			const nextTab = TABS[nextIndex];
+			if (!nextTab) return;
+			switchToTab(nextTab.type);
+		};
+
 		return {
-			render: (width: number) => container.render(width),
+			render: (width: number) => {
+				if (width !== lastWidth) {
+					lastWidth = width;
+					if (!sharedEntrypointDialogOpen && !searchActive) rebuildList();
+				}
+				return container.render(width);
+			},
 			invalidate: () => container.invalidate(),
 			handleInput: (data: string) => {
-				list.handleInput(data);
+				if (sharedEntrypointDialogOpen) {
+					list.handleInput(data);
+					tui.requestRender();
+					return;
+				}
+
+				if (matchesKey(data, "shift+tab") || matchesKey(data, "left")) {
+					cycleTab(-1);
+					return;
+				}
+				if (matchesKey(data, "tab") || matchesKey(data, "right")) {
+					cycleTab(1);
+					return;
+				}
+
+				const directTab = TABS.find((tab) => matchesKey(data, tab.shortcut));
+				if (directTab) {
+					switchToTab(directTab.type);
+					return;
+				}
+
+				const normalizedSearchInput = normalizeSearchInput(
+					data,
+					searchMirror.getValue(),
+				);
+				if (normalizedSearchInput === undefined) {
+					tui.requestRender();
+					return;
+				}
+				if (updateSearchState(normalizedSearchInput)) {
+					rebuildList();
+				}
+				list.handleInput(normalizedSearchInput);
 				tui.requestRender();
 			},
 		};
@@ -1093,6 +1739,24 @@ async function pickCategory(
 	return trimmed || undefined;
 }
 
+interface DiscoveredPackageResource {
+	resourceType: ChildResourceType;
+	item: InventoryItem;
+}
+
+interface PackageInspectionTarget {
+	source: string;
+	scope: "project" | "global";
+}
+
+type StandaloneSkillMode = "pi" | "agents";
+
+interface StandaloneResourceRoot {
+	resourceType: ChildResourceType;
+	root: string;
+	skillMode?: StandaloneSkillMode;
+}
+
 function inventoryItemFromUnmanaged(
 	entry: UnmanagedExtension,
 	category: string | undefined,
@@ -1100,10 +1764,6 @@ function inventoryItemFromUnmanaged(
 	const item: InventoryItem = {
 		id: entry.id,
 		label: entry.label,
-		description:
-			entry.kind === "package"
-				? `Discovered ${entry.scope} package`
-				: `Discovered ${entry.scope} extension path`,
 	};
 	if (category) item.category = category;
 	if (entry.source && entry.source !== entry.id) item.source = entry.source;
@@ -1111,22 +1771,569 @@ function inventoryItemFromUnmanaged(
 	return item;
 }
 
+function packagePath(value: string): string {
+	return value
+		.split(/[\\/]+/g)
+		.filter(Boolean)
+		.join("/");
+}
+
+function relativePackagePath(root: string, path: string): string {
+	return packagePath(relative(root, path));
+}
+
+function gitSourceWithoutRef(source: string): string {
+	const spec = source.startsWith("git:") ? source.slice(4) : source;
+	const at = spec.lastIndexOf("@");
+	const pathStart = Math.max(spec.lastIndexOf("/"), spec.lastIndexOf(":"));
+	return at > pathStart ? spec.slice(0, at) : spec;
+}
+
+function gitPackageRoot(source: string, baseDir: string): string | undefined {
+	const spec = gitSourceWithoutRef(source);
+	let host: string | undefined;
+	let repoPath: string | undefined;
+
+	const scpLike = spec.match(/^git@([^:]+):(.+)$/);
+	if (scpLike?.[1] && scpLike[2]) {
+		host = scpLike[1];
+		repoPath = scpLike[2];
+	} else {
+		try {
+			const parsed = new URL(spec);
+			host = parsed.hostname;
+			repoPath = parsed.pathname.replace(/^\/+/, "");
+		} catch {
+			const shorthand = spec.match(/^([^/:]+)\/(.+)$/);
+			if (shorthand?.[1] && shorthand[2]) {
+				host = shorthand[1];
+				repoPath = shorthand[2];
+			}
+		}
+	}
+
+	if (!host || !repoPath) return undefined;
+	return join(
+		baseDir,
+		"git",
+		host,
+		...packagePath(withoutGitSuffix(repoPath)).split("/"),
+	);
+}
+
+function packageRootForTarget(
+	cwd: string,
+	target: PackageInspectionTarget,
+): string | undefined {
+	const baseDir = scopeBaseDir(cwd, target.scope);
+	const npmName = npmPackageName(target.source);
+	if (npmName)
+		return join(baseDir, "npm", "node_modules", ...npmName.split("/"));
+	if (isPathLike(target.source)) return resolveFromBase(target.source, baseDir);
+	if (
+		target.source.startsWith("git:") ||
+		target.source.startsWith("http://") ||
+		target.source.startsWith("https://") ||
+		target.source.startsWith("ssh://") ||
+		target.source.startsWith("git@")
+	) {
+		return gitPackageRoot(target.source, baseDir);
+	}
+	return undefined;
+}
+
+function unmanagedPackageTarget(
+	entry: UnmanagedExtension,
+): PackageInspectionTarget | undefined {
+	if (entry.kind !== "package" || !entry.source) return undefined;
+	return { source: entry.source, scope: entry.scope };
+}
+
+async function directoryExists(path: string): Promise<boolean> {
+	try {
+		return (await fs.stat(path)).isDirectory();
+	} catch {
+		return false;
+	}
+}
+
+async function walkFiles(root: string): Promise<string[]> {
+	const entries = await fs.readdir(root, { withFileTypes: true });
+	const files: string[] = [];
+	for (const entry of entries) {
+		if (entry.name.startsWith(".") || entry.name === "node_modules") continue;
+		const fullPath = join(root, entry.name);
+		if (entry.isDirectory()) {
+			files.push(...(await walkFiles(fullPath)));
+		} else if (entry.isFile()) {
+			files.push(fullPath);
+		}
+	}
+	return files;
+}
+
+async function listDirectResourceFiles(
+	root: string,
+	fileExtension: string,
+): Promise<string[]> {
+	if (!(await directoryExists(root))) return [];
+	const entries = await fs.readdir(root, { withFileTypes: true });
+	return entries
+		.filter(
+			(entry) =>
+				entry.isFile() &&
+				!entry.name.startsWith(".") &&
+				entry.name.endsWith(fileExtension),
+		)
+		.map((entry) => join(root, entry.name))
+		.sort();
+}
+
+async function listStandaloneSkillFiles(
+	root: string,
+	mode: StandaloneSkillMode,
+	current = root,
+): Promise<string[]> {
+	if (!(await directoryExists(current))) return [];
+	const entries = await fs.readdir(current, { withFileTypes: true });
+	const skillFile = entries.find(
+		(entry) => entry.isFile() && entry.name === "SKILL.md",
+	);
+	if (skillFile) return [join(current, skillFile.name)];
+
+	const files: string[] = [];
+	if (mode === "pi" && current === root) {
+		files.push(
+			...entries
+				.filter(
+					(entry) =>
+						entry.isFile() &&
+						!entry.name.startsWith(".") &&
+						entry.name.endsWith(".md"),
+				)
+				.map((entry) => join(current, entry.name)),
+		);
+	}
+
+	for (const entry of entries) {
+		if (entry.name.startsWith(".") || entry.name === "node_modules") continue;
+		const fullPath = join(current, entry.name);
+		if (entry.isDirectory()) {
+			files.push(...(await listStandaloneSkillFiles(root, mode, fullPath)));
+		}
+	}
+	return files.sort();
+}
+
+async function listPackageFiles(
+	packageRoot: string,
+	directory: string,
+): Promise<string[]> {
+	const root = join(packageRoot, directory);
+	if (!(await directoryExists(root))) return [];
+	const files = await walkFiles(root);
+	return files.map((file) => relativePackagePath(packageRoot, file)).sort();
+}
+
+function isRuntimeExtensionFile(path: string): boolean {
+	return (
+		path.startsWith("extensions/") &&
+		(path.endsWith(".ts") || path.endsWith(".js")) &&
+		!path.endsWith(".d.ts")
+	);
+}
+
+function isSkillResource(path: string): boolean {
+	if (!path.startsWith("skills/") || !path.endsWith(".md")) return false;
+	if (basename(path) === "SKILL.md") return true;
+	return !path.slice("skills/".length).includes("/");
+}
+
+function isPromptResource(path: string): boolean {
+	return path.startsWith("prompts/") && path.endsWith(".md");
+}
+
+function isThemeResource(path: string): boolean {
+	return path.startsWith("themes/") && path.endsWith(".json");
+}
+
+function withoutFileExtension(path: string): string {
+	return basename(path).replace(/\.[^.]+$/, "");
+}
+
+function featureLabelForResource(
+	resourceType: ChildResourceType,
+	path: string,
+): string {
+	if (resourceType === "skills" && basename(path) === "SKILL.md") {
+		return basename(dirname(path));
+	}
+	return withoutFileExtension(path);
+}
+
+function normalizeFeatureToken(value: string): string {
+	return value.toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
+function featureTokensForResource(
+	resourceType: ChildResourceType,
+	path: string,
+): Set<string> {
+	const segments = packagePath(path).split("/");
+	const candidates = [featureLabelForResource(resourceType, path), ...segments];
+	const ignored = new Set([
+		"skill",
+		"skills",
+		"prompt",
+		"prompts",
+		"theme",
+		"themes",
+		"md",
+		"json",
+		"index",
+	]);
+	return new Set(
+		candidates
+			.map((candidate) =>
+				normalizeFeatureToken(candidate.replace(/\.[^.]+$/, "")),
+			)
+			.filter((token) => token.length > 1 && !ignored.has(token)),
+	);
+}
+
+function featureTokensForExtension(path: string): Set<string> {
+	const segments = packagePath(path).split("/");
+	const ignored = new Set(["extension", "extensions", "ts", "js", "index"]);
+	return new Set(
+		segments
+			.map((segment) => normalizeFeatureToken(segment.replace(/\.[^.]+$/, "")))
+			.filter((token) => token.length > 1 && !ignored.has(token)),
+	);
+}
+
+function setsIntersect(left: Set<string>, right: Set<string>): boolean {
+	for (const value of left) {
+		if (right.has(value)) return true;
+	}
+	return false;
+}
+
+function matchAssociatedExtensions(
+	resourceType: ChildResourceType,
+	resourcePath: string,
+	extensionPaths: string[],
+	hasRootIndex: boolean,
+): string[] {
+	if (resourceType === "themes") return [];
+	if (extensionPaths.length === 0) return hasRootIndex ? ["index.ts"] : [];
+
+	const resourceTokens = featureTokensForResource(resourceType, resourcePath);
+	const exactMatches = extensionPaths.filter((extensionPath) =>
+		setsIntersect(resourceTokens, featureTokensForExtension(extensionPath)),
+	);
+	if (exactMatches.length > 0) return exactMatches;
+
+	const resourceKey = normalizeFeatureToken(resourcePath);
+	return extensionPaths.filter((extensionPath) => {
+		const extensionKey = normalizeFeatureToken(extensionPath);
+		return (
+			[...resourceTokens].some(
+				(token) => token.length > 2 && extensionKey.includes(token),
+			) ||
+			[...featureTokensForExtension(extensionPath)].some(
+				(token) => token.length > 2 && resourceKey.includes(token),
+			)
+		);
+	});
+}
+
+function packageResourceItem(
+	parentId: string,
+	category: string | undefined,
+	resourceType: ChildResourceType,
+	resourcePath: string,
+	extensionPaths: string[],
+	hasRootIndex: boolean,
+): InventoryItem {
+	const associatedExtensions = matchAssociatedExtensions(
+		resourceType,
+		resourcePath,
+		extensionPaths,
+		hasRootIndex,
+	);
+	const item: InventoryItem = {
+		id: `${parentId}/${resourcePath}`,
+		label: defaultLabelForId(
+			featureLabelForResource(resourceType, resourcePath),
+		),
+		source: parentId,
+		path: resourcePath,
+	};
+	if (category) item.category = category;
+	if (associatedExtensions.length > 0) {
+		item.associatedResources = { extensions: associatedExtensions };
+	}
+	return item;
+}
+
+async function discoverPackageResources(
+	cwd: string,
+	target: PackageInspectionTarget | undefined,
+	parentId: string,
+	category: string | undefined,
+): Promise<DiscoveredPackageResource[]> {
+	if (!target) return [];
+	const packageRoot = packageRootForTarget(cwd, target);
+	if (!packageRoot || !(await directoryExists(packageRoot))) return [];
+
+	const [extensionFiles, skillFiles, promptFiles, themeFiles, hasRootIndex] =
+		await Promise.all([
+			listPackageFiles(packageRoot, "extensions"),
+			listPackageFiles(packageRoot, "skills"),
+			listPackageFiles(packageRoot, "prompts"),
+			listPackageFiles(packageRoot, "themes"),
+			pathExists(join(packageRoot, "index.ts")),
+		]);
+	const extensionPaths = extensionFiles.filter(isRuntimeExtensionFile);
+
+	return [
+		...skillFiles.filter(isSkillResource).map((resourcePath) => ({
+			resourceType: "skills" as const,
+			item: packageResourceItem(
+				parentId,
+				category,
+				"skills",
+				resourcePath,
+				extensionPaths,
+				hasRootIndex,
+			),
+		})),
+		...promptFiles.filter(isPromptResource).map((resourcePath) => ({
+			resourceType: "prompts" as const,
+			item: packageResourceItem(
+				parentId,
+				category,
+				"prompts",
+				resourcePath,
+				extensionPaths,
+				hasRootIndex,
+			),
+		})),
+		...themeFiles.filter(isThemeResource).map((resourcePath) => ({
+			resourceType: "themes" as const,
+			item: packageResourceItem(
+				parentId,
+				category,
+				"themes",
+				resourcePath,
+				extensionPaths,
+				hasRootIndex,
+			),
+		})),
+	];
+}
+
+function appendInventoryItem(
+	inventory: Inventory,
+	resourceType: ResourceType,
+	item: InventoryItem,
+): boolean {
+	let items = inventory[resourceType];
+	if (!items) {
+		items = [];
+		inventory[resourceType] = items;
+	}
+	const itemPath = item.path
+		? normalizePackageResourcePath(item.path)
+		: undefined;
+	const exists = items.some((existing) => {
+		if (existing.id === item.id) return true;
+		if (!existing.path || !itemPath) return false;
+		return (
+			existing.source === item.source &&
+			normalizePackageResourcePath(existing.path) === itemPath
+		);
+	});
+	if (exists) return false;
+	items.push(item);
+	return true;
+}
+
+function managedPackageTarget(
+	cwd: string,
+	settings: LoadedSettings,
+	item: InventoryItem,
+): PackageInspectionTarget | undefined {
+	const projectPackage = settings.project.packages?.find((pkg) =>
+		packageMatchesItem(pkg, item, projectPiDir(cwd)),
+	);
+	if (projectPackage) {
+		return { source: packageSource(projectPackage), scope: "project" };
+	}
+
+	const globalPackage = settings.global.packages?.find((pkg) =>
+		packageMatchesItem(pkg, item, GLOBAL_PI_DIR),
+	);
+	if (globalPackage) {
+		return { source: packageSource(globalPackage), scope: "global" };
+	}
+
+	return undefined;
+}
+
+async function discoverManagedPackageResources(
+	cwd: string,
+	inventory: Inventory,
+): Promise<number> {
+	const settings = await loadSettings(cwd);
+	let added = 0;
+	for (const extensionItem of inventory.extensions ?? []) {
+		const resources = await discoverPackageResources(
+			cwd,
+			managedPackageTarget(cwd, settings, extensionItem),
+			extensionItem.id,
+			extensionItem.category,
+		);
+		for (const resource of resources) {
+			if (
+				appendInventoryItem(inventory, resource.resourceType, resource.item)
+			) {
+				added++;
+			}
+		}
+	}
+	return added;
+}
+
+async function findGitRepoRoot(cwd: string): Promise<string | undefined> {
+	let dir = resolve(cwd);
+	while (true) {
+		if (await directoryExists(join(dir, ".git"))) return dir;
+		const parent = dirname(dir);
+		if (parent === dir) return undefined;
+		dir = parent;
+	}
+}
+
+async function projectAgentsSkillRoots(cwd: string): Promise<string[]> {
+	const roots: string[] = [];
+	const repoRoot = await findGitRepoRoot(cwd);
+	let dir = resolve(cwd);
+	while (true) {
+		roots.push(join(dir, ".agents", "skills"));
+		if (repoRoot && dir === repoRoot) break;
+		const parent = dirname(dir);
+		if (parent === dir) break;
+		dir = parent;
+	}
+	return roots;
+}
+
+async function standaloneResourceRoots(
+	cwd: string,
+): Promise<StandaloneResourceRoot[]> {
+	return [
+		{
+			resourceType: "skills",
+			root: join(GLOBAL_PI_DIR, "skills"),
+			skillMode: "pi",
+		},
+		{
+			resourceType: "skills",
+			root: join(homedir(), ".agents", "skills"),
+			skillMode: "agents",
+		},
+		{ resourceType: "prompts", root: join(GLOBAL_PI_DIR, "prompts") },
+		{ resourceType: "themes", root: join(GLOBAL_PI_DIR, "themes") },
+		{
+			resourceType: "skills",
+			root: join(projectPiDir(cwd), "skills"),
+			skillMode: "pi",
+		},
+		...(await projectAgentsSkillRoots(cwd)).map((root) => ({
+			resourceType: "skills" as const,
+			root,
+			skillMode: "agents" as const,
+		})),
+		{ resourceType: "prompts", root: join(projectPiDir(cwd), "prompts") },
+		{ resourceType: "themes", root: join(projectPiDir(cwd), "themes") },
+	];
+}
+
+async function standaloneResourcePaths(
+	root: StandaloneResourceRoot,
+): Promise<string[]> {
+	if (root.resourceType === "skills") {
+		return listStandaloneSkillFiles(root.root, root.skillMode ?? "pi");
+	}
+	if (root.resourceType === "prompts") {
+		return listDirectResourceFiles(root.root, ".md");
+	}
+	return listDirectResourceFiles(root.root, ".json");
+}
+
+function standaloneResourceId(
+	resourceType: ChildResourceType,
+	path: string,
+): string {
+	const id = featureLabelForResource(resourceType, path);
+	return id || defaultIdForSource(path);
+}
+
+function standaloneResourceItem(
+	resourceType: ChildResourceType,
+	path: string,
+): InventoryItem {
+	const id = standaloneResourceId(resourceType, path);
+	return {
+		id,
+		label: defaultLabelForId(id),
+		category: "Standalone",
+		description: `Discovered standalone ${resourceType.slice(0, -1)}`,
+		path,
+	};
+}
+
+async function discoverStandaloneResources(
+	cwd: string,
+	inventory: Inventory,
+): Promise<number> {
+	let added = 0;
+	const seenPaths = new Set<string>();
+	for (const root of await standaloneResourceRoots(cwd)) {
+		for (const path of await standaloneResourcePaths(root)) {
+			const normalizedPath = resolve(path);
+			if (seenPaths.has(normalizedPath)) continue;
+			seenPaths.add(normalizedPath);
+			if (
+				appendInventoryItem(
+					inventory,
+					root.resourceType,
+					standaloneResourceItem(root.resourceType, normalizedPath),
+				)
+			) {
+				added++;
+			}
+		}
+	}
+	return added;
+}
+
 async function runDiscover(
 	ctx: ExtensionCommandContext,
 	loadedInventory: LoadedInventory,
 ): Promise<void> {
 	const unmanaged = await discoverUnmanaged(ctx.cwd, loadedInventory.inventory);
-	if (unmanaged.length === 0) {
-		ctx.ui.notify("No unmanaged extensions found.", "info");
-		return;
+	if (unmanaged.length > 0) {
+		ctx.ui.notify(
+			`Unmanaged extensions (${unmanaged.length}):\n${renderUnmanagedList(unmanaged)}`,
+			"info",
+		);
 	}
 
-	ctx.ui.notify(
-		`Unmanaged extensions (${unmanaged.length}):\n${renderUnmanagedList(unmanaged)}`,
-		"info",
-	);
-
 	let added = 0;
+	let addedResources = 0;
+	let addedStandaloneResources = 0;
 	let skipped = 0;
 	loadedInventory.inventory.extensions ??= [];
 
@@ -1148,18 +2355,56 @@ async function runDiscover(
 		}
 
 		const category = await pickCategory(ctx, loadedInventory.inventory, entry);
-		loadedInventory.inventory.extensions.push(
-			inventoryItemFromUnmanaged(entry, category),
+		const extensionItem = inventoryItemFromUnmanaged(entry, category);
+		loadedInventory.inventory.extensions.push(extensionItem);
+
+		const discoveredResources = await discoverPackageResources(
+			ctx.cwd,
+			unmanagedPackageTarget(entry),
+			extensionItem.id,
+			category,
 		);
+		for (const resource of discoveredResources) {
+			if (
+				appendInventoryItem(
+					loadedInventory.inventory,
+					resource.resourceType,
+					resource.item,
+				)
+			) {
+				addedResources++;
+			}
+		}
+
 		await writeJsonAtomic(loadedInventory.path, loadedInventory.inventory);
 		added++;
 	}
 
+	const backfilledResources = await discoverManagedPackageResources(
+		ctx.cwd,
+		loadedInventory.inventory,
+	);
+	addedResources += backfilledResources;
+	addedStandaloneResources = await discoverStandaloneResources(
+		ctx.cwd,
+		loadedInventory.inventory,
+	);
+	if (backfilledResources > 0 || addedStandaloneResources > 0) {
+		await writeJsonAtomic(loadedInventory.path, loadedInventory.inventory);
+	}
+
 	ctx.ui.notify(
 		[
-			`Discovery complete. Added ${added}, skipped ${skipped}.`,
+			`Discovery complete. Added ${added}, child resources ${addedResources}, standalone resources ${addedStandaloneResources}, skipped ${skipped}.`,
+			unmanaged.length === 0 &&
+			addedResources === 0 &&
+			addedStandaloneResources === 0
+				? "No unmanaged extensions or missing resources found."
+				: undefined,
 			`inventory: ${loadedInventory.path}`,
-		].join("\n"),
+		]
+			.filter(Boolean)
+			.join("\n"),
 		"info",
 	);
 	ctx.ui.setStatus(
