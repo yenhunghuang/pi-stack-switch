@@ -39,6 +39,8 @@ const SELF_IDS = ["pi-stack-switch", "@your-org/pi-stack-switch"];
 
 type ResourceType = "extensions" | "skills" | "prompts" | "themes";
 type ChildResourceType = Exclude<ResourceType, "extensions">;
+type ResourceReferenceGroups = Partial<Record<ResourceType, string[]>>;
+type ReferenceEdgeKind = "references" | "dependsOn";
 
 const TABS = [
 	{ type: "extensions", label: "Extensions", shortcut: "1" },
@@ -71,6 +73,10 @@ interface InventoryItem {
 	source?: string;
 	/** Optional resource path relative to package root or top-level .pi/agent dir. */
 	path?: string;
+	/** Optional soft references to other resources grouped by target resource type. */
+	references?: ResourceReferenceGroups;
+	/** Optional hard dependencies on other resources grouped by target resource type. */
+	dependsOn?: ResourceReferenceGroups;
 	/** Optional code resources that should be toggled together with this item. */
 	associatedResources?: {
 		extensions?: string[];
@@ -127,6 +133,14 @@ interface UnmanagedExtension {
 	kind: "package" | "top-level";
 	source?: string;
 	path?: string;
+}
+
+interface InventoryReferenceEdge {
+	kind: ReferenceEdgeKind;
+	sourceResourceType: ResourceType;
+	targetResourceType: ResourceType;
+	source: InventoryItem;
+	target: InventoryItem;
 }
 
 function projectPiDir(cwd: string): string {
@@ -418,6 +432,141 @@ function associatedExtensionPaths(item: InventoryItem): string[] {
 				.map(normalizePackageResourcePath)
 				.filter(Boolean),
 		),
+	);
+}
+
+function normalizeReferencePath(value: string): string {
+	return packagePath(normalizePackageResourcePath(value)).toLowerCase();
+}
+
+function normalizeReferenceLabel(value: string): string {
+	return normalizeFeatureToken(value);
+}
+
+function uniqueMatch<T>(items: T[]): T | undefined {
+	return items.length === 1 ? items[0] : undefined;
+}
+
+function resolveReferenceTarget(
+	inventory: Inventory,
+	targetResourceType: ResourceType,
+	target: string,
+): InventoryItem | undefined {
+	const items = inventory[targetResourceType] ?? [];
+	const trimmedTarget = target.trim();
+	if (!trimmedTarget) return undefined;
+
+	const idMatch = uniqueMatch(
+		items.filter((item) => item.id === trimmedTarget),
+	);
+	if (idMatch) return idMatch;
+
+	const normalizedPath = normalizeReferencePath(trimmedTarget);
+	const pathMatch = uniqueMatch(
+		items.filter(
+			(item) =>
+				item.path !== undefined &&
+				normalizeReferencePath(item.path) === normalizedPath,
+		),
+	);
+	if (pathMatch) return pathMatch;
+
+	const normalizedLabel = normalizeReferenceLabel(trimmedTarget);
+	return uniqueMatch(
+		items.filter(
+			(item) => normalizeReferenceLabel(item.label) === normalizedLabel,
+		),
+	);
+}
+
+function referencesForKind(
+	item: InventoryItem,
+	kind: ReferenceEdgeKind,
+): ResourceReferenceGroups | undefined {
+	return kind === "references" ? item.references : item.dependsOn;
+}
+
+function buildInventoryReferenceGraph(
+	inventory: Inventory,
+): InventoryReferenceEdge[] {
+	const edges: InventoryReferenceEdge[] = [];
+	for (const sourceResourceType of [
+		"extensions",
+		"skills",
+		"prompts",
+		"themes",
+	] as const) {
+		for (const source of inventory[sourceResourceType] ?? []) {
+			for (const kind of ["references", "dependsOn"] as const) {
+				const groups = referencesForKind(source, kind);
+				if (!groups) continue;
+				for (const targetResourceType of [
+					"extensions",
+					"skills",
+					"prompts",
+					"themes",
+				] as const) {
+					for (const targetRef of groups[targetResourceType] ?? []) {
+						const target = resolveReferenceTarget(
+							inventory,
+							targetResourceType,
+							targetRef,
+						);
+						if (!target) continue;
+						edges.push({
+							kind,
+							sourceResourceType,
+							targetResourceType,
+							source,
+							target,
+						});
+					}
+				}
+			}
+		}
+	}
+	return edges;
+}
+
+function isItemEnabled(
+	state: EnabledState,
+	resourceType: ResourceType,
+	item: InventoryItem,
+): boolean {
+	return state[resourceType].has(item.id);
+}
+
+function computeDanglingEdges(
+	graph: InventoryReferenceEdge[],
+	state: EnabledState,
+): InventoryReferenceEdge[] {
+	return graph.filter(
+		(edge) =>
+			isItemEnabled(state, edge.sourceResourceType, edge.source) &&
+			!isItemEnabled(state, edge.targetResourceType, edge.target),
+	);
+}
+
+function referenceEdgeKey(edge: InventoryReferenceEdge): string {
+	return [
+		edge.kind,
+		edge.sourceResourceType,
+		edge.source.id,
+		edge.targetResourceType,
+		edge.target.id,
+	].join(":");
+}
+
+function findNewDanglingEdges(
+	graph: InventoryReferenceEdge[],
+	before: EnabledState,
+	after: EnabledState,
+): InventoryReferenceEdge[] {
+	const beforeKeys = new Set(
+		computeDanglingEdges(graph, before).map(referenceEdgeKey),
+	);
+	return computeDanglingEdges(graph, after).filter(
+		(edge) => !beforeKeys.has(referenceEdgeKey(edge)),
 	);
 }
 
@@ -1063,6 +1212,160 @@ function createSharedEntrypointDialog(
 	};
 }
 
+type DanglingWarningChoice = "apply" | "cascade";
+
+interface DanglingWarningDecision {
+	choice: DanglingWarningChoice;
+	sourcesToDisable: SettingItemMeta[];
+}
+
+function resourceTypeSingular(resourceType: ResourceType): string {
+	return resourceType.slice(0, -1);
+}
+
+function edgeDescription(edge: InventoryReferenceEdge): string {
+	const verb = edge.kind === "dependsOn" ? "depends on" : "references";
+	return `${edge.source.label} ${verb} disabled ${resourceTypeSingular(edge.targetResourceType)}: ${edge.target.label}`;
+}
+
+function sourceMetaForEdge(edge: InventoryReferenceEdge): SettingItemMeta {
+	return { resourceType: edge.sourceResourceType, item: edge.source };
+}
+
+function uniqueSourceMetas(edges: InventoryReferenceEdge[]): SettingItemMeta[] {
+	const seen = new Set<string>();
+	const sources: SettingItemMeta[] = [];
+	for (const edge of edges) {
+		const key = `${edge.sourceResourceType}:${edge.source.id}`;
+		if (seen.has(key)) continue;
+		seen.add(key);
+		sources.push(sourceMetaForEdge(edge));
+	}
+	return sources;
+}
+
+function simulateToggleState(
+	state: EnabledState,
+	meta: SettingItemMeta,
+	enabled: boolean,
+	childrenByParent: Map<string, SettingItemMeta[]>,
+): EnabledState {
+	const next = cloneEnabledState(state);
+	setEnabledState(next, meta.resourceType, meta.item.id, enabled);
+	if (meta.resourceType !== "extensions") return next;
+	for (const child of childrenByParent.get(meta.item.id) ?? []) {
+		setEnabledState(next, child.resourceType, child.item.id, enabled);
+	}
+	return next;
+}
+
+function createDanglingWarningDialog(
+	theme: Theme,
+	toggled: SettingItemMeta,
+	edges: InventoryReferenceEdge[],
+	onDone: (choice?: DanglingWarningDecision) => void,
+) {
+	let selected = 0;
+	const sourcesToDisable = uniqueSourceMetas(edges);
+	const hasDependency = edges.some((edge) => edge.kind === "dependsOn");
+	const options = [
+		{
+			choice: "apply" as const,
+			title: "只套用目前 toggle",
+			detail: "保留列出的 source resources 啟用",
+		},
+		{
+			choice: "cascade" as const,
+			title: "一併關閉 source resources",
+			detail: "只關閉下方直接列出的 source resources",
+		},
+		{
+			choice: undefined,
+			title: "取消",
+			detail: "不更新狀態、不寫入 settings.json",
+		},
+	];
+	const edgeLines = edges
+		.slice(0, 8)
+		.map((edge) => `• ${edgeDescription(edge)}`);
+	if (edges.length > edgeLines.length) {
+		edgeLines.push(`• ...and ${edges.length - edgeLines.length} more`);
+	}
+
+	return {
+		render: (width: number) => {
+			const lines = [
+				theme.fg(
+					"warning",
+					theme.bold(
+						hasDependency
+							? "⚠ Dangling dependency warning"
+							: "⚠ Dangling reference warning",
+					),
+				),
+				`切換 resource：${toggled.item.label} (${resourceTypeSingular(toggled.resourceType)})`,
+				"此操作會造成新的 dangling edges：",
+				...edgeLines,
+				"",
+				"請選擇處理方式：",
+				...options.map((option, index) => {
+					const marker = index === selected ? "›" : " ";
+					const line = `${marker} ${index + 1}. ${option.title} — ${option.detail}`;
+					return index === selected
+						? theme.bg("selectedBg", theme.fg("accent", theme.bold(line)))
+						: theme.fg("muted", line);
+				}),
+				"",
+				theme.fg("dim", "↑↓/←→ 選擇 · 1/2/3 直接選 · Enter 確認 · Esc 取消"),
+			];
+			return lines.map((line) => truncateToWidth(line, width));
+		},
+		handleInput: (data: string) => {
+			if (
+				matchesKey(data, "up") ||
+				matchesKey(data, "left") ||
+				matchesKey(data, "shift+tab")
+			) {
+				selected = (selected + options.length - 1) % options.length;
+				return;
+			}
+			if (
+				matchesKey(data, "down") ||
+				matchesKey(data, "right") ||
+				matchesKey(data, "tab")
+			) {
+				selected = (selected + 1) % options.length;
+				return;
+			}
+			if (matchesKey(data, "1")) {
+				onDone({ choice: "apply", sourcesToDisable });
+				return;
+			}
+			if (matchesKey(data, "2")) {
+				onDone({ choice: "cascade", sourcesToDisable });
+				return;
+			}
+			if (matchesKey(data, "3")) {
+				onDone(undefined);
+				return;
+			}
+			if (matchesKey(data, "enter") || data === " ") {
+				const option = options[selected];
+				onDone(
+					option?.choice
+						? { choice: option.choice, sourcesToDisable }
+						: undefined,
+				);
+				return;
+			}
+			if (matchesKey(data, "escape")) {
+				onDone(undefined);
+			}
+		},
+		invalidate: () => {},
+	};
+}
+
 function buildSettingItems(
 	inventory: Inventory,
 	state: EnabledState,
@@ -1277,6 +1580,9 @@ async function openSelector(
 ): Promise<{ toggles: number; blocked: string[]; fallbackWrites: string[] }> {
 	const initial = await readEnabled(ctx.cwd, loadedInventory.inventory);
 	const currentState = cloneEnabledState(initial);
+	const referenceGraph = buildInventoryReferenceGraph(
+		loadedInventory.inventory,
+	);
 	let currentTab: TabType = "extensions";
 	let lastWidth = 80;
 	const foldedParentRows = new Set<string>();
@@ -1350,8 +1656,10 @@ async function openSelector(
 		let childrenByParent = view.childrenByParent;
 		let parentRows = view.parentRows;
 		let sharedEntrypointDialogOpen = false;
+		let danglingWarningDialogOpen = false;
 		let searchMirror = new Input();
 		const sharedEntrypointChoices = new Map<string, SharedEntrypointChoice>();
+		const danglingWarningDecisions = new Map<string, DanglingWarningDecision>();
 
 		const resetSearchState = () => {
 			searchMirror = new Input();
@@ -1373,8 +1681,47 @@ async function openSelector(
 		const createList = (nextItems: SettingItem[], selectedId?: string) => {
 			const itemsWithDialogs = nextItems.map((item) => {
 				const m = meta.get(item.id);
+				if (!m) return item;
+
+				const nextEnabled = item.currentValue !== "on";
+				const nextState = simulateToggleState(
+					currentState,
+					m,
+					nextEnabled,
+					childrenByParent,
+				);
+				const newDanglingEdges = findNewDanglingEdges(
+					referenceGraph,
+					currentState,
+					nextState,
+				);
+				if (newDanglingEdges.length > 0) {
+					return {
+						...item,
+						submenu: (
+							_currentValue: string,
+							submenuDone: (selectedValue?: string) => void,
+						) => {
+							danglingWarningDialogOpen = true;
+							return createDanglingWarningDialog(
+								theme,
+								m,
+								newDanglingEdges,
+								(decision) => {
+									danglingWarningDialogOpen = false;
+									if (decision) {
+										danglingWarningDecisions.set(item.id, decision);
+										submenuDone(nextEnabled ? "on" : "off");
+										return;
+									}
+									submenuDone(undefined);
+								},
+							);
+						},
+					};
+				}
+
 				if (
-					!m ||
 					!shouldConfirmSharedEntrypointDisable(
 						loadedInventory.inventory,
 						currentState,
@@ -1439,6 +1786,8 @@ async function openSelector(
 					const enabled = newValue === "on";
 					const sharedChoice = sharedEntrypointChoices.get(settingId);
 					sharedEntrypointChoices.delete(settingId);
+					const danglingDecision = danglingWarningDecisions.get(settingId);
+					danglingWarningDecisions.delete(settingId);
 					const parentToDisable =
 						!enabled && sharedChoice === "disable-main-extension"
 							? findParentExtension(loadedInventory.inventory, m.item)
@@ -1465,6 +1814,18 @@ async function openSelector(
 							child.resourceType,
 							child.item.id,
 							enabled,
+						);
+					}
+					const cascadeSources =
+						danglingDecision?.choice === "cascade"
+							? danglingDecision.sourcesToDisable
+							: [];
+					for (const source of cascadeSources) {
+						setEnabledState(
+							currentState,
+							source.resourceType,
+							source.item.id,
+							false,
 						);
 					}
 
@@ -1513,6 +1874,22 @@ async function openSelector(
 								if (parentResult.fallbackScope) {
 									fallbackWrites.push(
 										`${parentToDisable.id} (${parentResult.fallbackScope})`,
+									);
+								}
+							}
+
+							for (const source of cascadeSources) {
+								const sourceResult = await applyToggle(
+									ctx.cwd,
+									loadedInventory.scope,
+									source.resourceType,
+									source.item,
+									false,
+								);
+								if (sourceResult.blocked) blocked.push(sourceResult.blocked);
+								if (sourceResult.fallbackScope) {
+									fallbackWrites.push(
+										`${source.item.id} (${sourceResult.fallbackScope})`,
 									);
 								}
 							}
@@ -1575,13 +1952,19 @@ async function openSelector(
 			render: (width: number) => {
 				if (width !== lastWidth) {
 					lastWidth = width;
-					if (!sharedEntrypointDialogOpen && !searchActive) rebuildList();
+					if (
+						!sharedEntrypointDialogOpen &&
+						!danglingWarningDialogOpen &&
+						!searchActive
+					) {
+						rebuildList();
+					}
 				}
 				return container.render(width);
 			},
 			invalidate: () => container.invalidate(),
 			handleInput: (data: string) => {
-				if (sharedEntrypointDialogOpen) {
+				if (sharedEntrypointDialogOpen || danglingWarningDialogOpen) {
 					list.handleInput(data);
 					tui.requestRender();
 					return;
@@ -1631,6 +2014,20 @@ async function openSelector(
 	return { toggles, blocked: Array.from(new Set(blocked)), fallbackWrites };
 }
 
+function formatStackFooter(
+	enabled: number,
+	total: number,
+	unmanagedCount: number,
+	danglingCount: number,
+): string {
+	const suffixParts = [
+		unmanagedCount ? `${unmanagedCount} unmanaged` : undefined,
+		danglingCount ? `${danglingCount} dangling` : undefined,
+	].filter((part): part is string => part !== undefined);
+	const suffix = suffixParts.length ? ` (${suffixParts.join(", ")})` : "";
+	return `stack: ${enabled}/${total}${suffix}`;
+}
+
 async function computeFooter(
 	cwd: string,
 	inventory: Inventory,
@@ -1648,12 +2045,35 @@ async function computeFooter(
 		state.skills.size +
 		state.prompts.size +
 		state.themes.size;
-	const suffix = unmanaged.length ? ` (${unmanaged.length} unmanaged)` : "";
-	return `stack: ${enabled}/${total}${suffix}`;
+	const dangling = computeDanglingEdges(
+		buildInventoryReferenceGraph(inventory),
+		state,
+	);
+	return formatStackFooter(enabled, total, unmanaged.length, dangling.length);
+}
+
+function danglingWarningsForItem(
+	dangling: InventoryReferenceEdge[],
+	resourceType: ResourceType,
+	item: InventoryItem,
+): string[] {
+	return dangling
+		.filter(
+			(edge) =>
+				edge.sourceResourceType === resourceType && edge.source.id === item.id,
+		)
+		.map((edge) => {
+			const verb = edge.kind === "dependsOn" ? "depends on" : "references";
+			return `⚠ ${verb} disabled ${resourceTypeSingular(edge.targetResourceType)}: ${edge.target.label}`;
+		});
 }
 
 function renderTextList(inventory: Inventory, state: EnabledState): string {
 	const lines: string[] = [];
+	const dangling = computeDanglingEdges(
+		buildInventoryReferenceGraph(inventory),
+		state,
+	);
 	const renderSection = (title: string, resourceType: ResourceType) => {
 		const items = inventory[resourceType];
 		if (!items?.length) return;
@@ -1662,8 +2082,12 @@ function renderTextList(inventory: Inventory, state: EnabledState): string {
 			const on = state[resourceType].has(item.id);
 			const mark = on ? "[✓]" : "[ ]";
 			const category = item.category ? ` (${item.category})` : "";
+			const warnings = on
+				? danglingWarningsForItem(dangling, resourceType, item)
+				: [];
+			const warningSuffix = warnings.length ? ` ${warnings.join("; ")}` : "";
 			const desc = item.description ? `\n      ${item.description}` : "";
-			lines.push(`  ${mark} ${item.label}${category}${desc}`);
+			lines.push(`  ${mark} ${item.label}${category}${warningSuffix}${desc}`);
 		}
 	};
 
@@ -2319,6 +2743,154 @@ async function discoverStandaloneResources(
 	return added;
 }
 
+function packageTargetForSource(
+	cwd: string,
+	settings: LoadedSettings,
+	source: string,
+): PackageInspectionTarget | undefined {
+	const projectPackage = settings.project.packages?.find((pkg) =>
+		packageMatches(packageSource(pkg), source, projectPiDir(cwd)),
+	);
+	if (projectPackage) {
+		return { source: packageSource(projectPackage), scope: "project" };
+	}
+
+	const globalPackage = settings.global.packages?.find((pkg) =>
+		packageMatches(packageSource(pkg), source, GLOBAL_PI_DIR),
+	);
+	if (globalPackage) {
+		return { source: packageSource(globalPackage), scope: "global" };
+	}
+	return undefined;
+}
+
+function skillPackageRoot(
+	cwd: string,
+	settings: LoadedSettings,
+	inventory: Inventory,
+	item: InventoryItem,
+): string | undefined {
+	if (!item.source) return undefined;
+	const parent = findParentExtension(inventory, item);
+	const target = parent
+		? managedPackageTarget(cwd, settings, parent)
+		: packageTargetForSource(cwd, settings, item.source);
+	return target ? packageRootForTarget(cwd, target) : undefined;
+}
+
+function skillFilePathForItem(
+	cwd: string,
+	settings: LoadedSettings,
+	inventory: Inventory,
+	item: InventoryItem,
+): string | undefined {
+	if (!item.path) return undefined;
+	if (item.source) {
+		const root = skillPackageRoot(cwd, settings, inventory, item);
+		return root
+			? join(root, normalizePackageResourcePath(item.path))
+			: undefined;
+	}
+	return resolveFromBase(item.path, projectPiDir(cwd));
+}
+
+function skillReferenceTokens(item: InventoryItem): Set<string> {
+	const candidates = [item.id, item.label, normalizeReferenceLabel(item.label)];
+	if (item.path) {
+		const normalizedPath = packagePath(normalizePackageResourcePath(item.path));
+		const pathBase = withoutFileExtension(normalizedPath);
+		candidates.push(basename(pathBase));
+		if (basename(normalizedPath) === "SKILL.md") {
+			candidates.push(basename(dirname(normalizedPath)));
+		}
+	}
+	return new Set(
+		candidates
+			.map((candidate) => candidate.trim())
+			.filter((candidate) => normalizeReferenceLabel(candidate).length > 1),
+	);
+}
+
+function normalizedWords(value: string): string {
+	return value
+		.toLowerCase()
+		.replace(/[^a-z0-9]+/g, " ")
+		.trim()
+		.replace(/\s+/g, " ");
+}
+
+function compactReferenceToken(value: string): string {
+	return normalizedWords(value).replace(/ /g, "");
+}
+
+function hasHighConfidenceSkillReference(
+	content: string,
+	tokens: Set<string>,
+): boolean {
+	const words = ` ${normalizedWords(content)} `;
+	const compact = content.toLowerCase().replace(/[\s_-]+/g, "");
+	for (const token of tokens) {
+		const tokenWords = normalizedWords(token);
+		const tokenCompact = compactReferenceToken(token);
+		if (!tokenWords || !tokenCompact) continue;
+		if (words.includes(` invoke ${tokenWords} skill `)) return true;
+		if (words.includes(` use ${tokenWords} skill `)) return true;
+		if (words.includes(` ${tokenWords} first `)) return true;
+		if (compact.includes(`/skill:${tokenCompact}`)) return true;
+		if (compact.includes(`superpowers:${tokenCompact}`)) return true;
+	}
+	return false;
+}
+
+function addSkillReference(source: InventoryItem, targetId: string): boolean {
+	source.references ??= {};
+	const references = source.references.skills ?? [];
+	if (references.includes(targetId)) return false;
+	source.references.skills = [...references, targetId];
+	return true;
+}
+
+function inferSkillReferencesFromContent(
+	source: InventoryItem,
+	content: string,
+	skills: InventoryItem[],
+): number {
+	let added = 0;
+	for (const target of skills) {
+		if (target.id === source.id) continue;
+		if (
+			hasHighConfidenceSkillReference(content, skillReferenceTokens(target))
+		) {
+			if (addSkillReference(source, target.id)) added++;
+		}
+	}
+	return added;
+}
+
+async function inferSkillReferences(
+	cwd: string,
+	inventory: Inventory,
+): Promise<number> {
+	const skills = inventory.skills ?? [];
+	if (skills.length === 0) return 0;
+	const settings = await loadSettings(cwd);
+	let added = 0;
+
+	for (const source of skills) {
+		const path = skillFilePathForItem(cwd, settings, inventory, source);
+		if (!path) continue;
+		let content: string;
+		try {
+			content = await fs.readFile(path, "utf-8");
+		} catch {
+			continue;
+		}
+
+		added += inferSkillReferencesFromContent(source, content, skills);
+	}
+	return added;
+}
+
 async function runDiscover(
 	ctx: ExtensionCommandContext,
 	loadedInventory: LoadedInventory,
@@ -2334,6 +2906,7 @@ async function runDiscover(
 	let added = 0;
 	let addedResources = 0;
 	let addedStandaloneResources = 0;
+	let inferredSkillReferences = 0;
 	let skipped = 0;
 	loadedInventory.inventory.extensions ??= [];
 
@@ -2389,17 +2962,26 @@ async function runDiscover(
 		ctx.cwd,
 		loadedInventory.inventory,
 	);
-	if (backfilledResources > 0 || addedStandaloneResources > 0) {
+	inferredSkillReferences = await inferSkillReferences(
+		ctx.cwd,
+		loadedInventory.inventory,
+	);
+	if (
+		backfilledResources > 0 ||
+		addedStandaloneResources > 0 ||
+		inferredSkillReferences > 0
+	) {
 		await writeJsonAtomic(loadedInventory.path, loadedInventory.inventory);
 	}
 
 	ctx.ui.notify(
 		[
-			`Discovery complete. Added ${added}, child resources ${addedResources}, standalone resources ${addedStandaloneResources}, skipped ${skipped}.`,
+			`Discovery complete. Added ${added}, child resources ${addedResources}, standalone resources ${addedStandaloneResources}, inferred skill references ${inferredSkillReferences}, skipped ${skipped}.`,
 			unmanaged.length === 0 &&
 			addedResources === 0 &&
-			addedStandaloneResources === 0
-				? "No unmanaged extensions or missing resources found."
+			addedStandaloneResources === 0 &&
+			inferredSkillReferences === 0
+				? "No unmanaged extensions, missing resources, or skill references found."
 				: undefined,
 			`inventory: ${loadedInventory.path}`,
 		]
@@ -2412,6 +2994,15 @@ async function runDiscover(
 		await computeFooter(ctx.cwd, loadedInventory.inventory),
 	);
 }
+
+export type { EnabledState, Inventory, InventoryItem, InventoryReferenceEdge };
+export {
+	buildInventoryReferenceGraph,
+	computeDanglingEdges,
+	formatStackFooter,
+	inferSkillReferencesFromContent,
+	renderTextList,
+};
 
 export default function piStackSwitch(pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
