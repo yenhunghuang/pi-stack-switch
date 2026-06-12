@@ -1011,6 +1011,7 @@ interface BuildSettingItemsOptions {
 	width?: number;
 	foldedParentRows?: ReadonlySet<string>;
 	searchActive?: boolean;
+	theme?: Theme;
 }
 
 const STANDALONE_PARENT_ID = "standalone";
@@ -1031,6 +1032,27 @@ function parentExpanded(
 	// Empty fold state means every parent starts folded; selected rows in the set
 	// are expanded by user action. Search mode temporarily expands all rows.
 	return searchActive || foldedParentRows.has(rowId);
+}
+
+function computeWarningParentRowIds(
+	inventory: Inventory,
+	state: EnabledState,
+): Set<string> {
+	const rowIds = new Set<string>();
+	const extensions = inventory.extensions ?? [];
+	for (const resourceType of ["skills", "prompts", "themes"] as const) {
+		for (const item of inventory[resourceType] ?? []) {
+			if (!item.source) continue;
+			const parent = extensions.find(
+				(ext) => ext.id === item.source || ext.source === item.source,
+			);
+			if (!parent) continue;
+			if (state.extensions.has(parent.id)) continue;
+			if (!state[resourceType].has(item.id)) continue;
+			rowIds.add(parentRowId(resourceType, parent.id));
+		}
+	}
+	return rowIds;
 }
 
 function normalizeSearchInput(
@@ -1137,7 +1159,7 @@ function createSharedEntrypointDialog(
 	siblings: SettingItemMeta[],
 	onDone: (choice?: SharedEntrypointChoice) => void,
 ) {
-	let selected = 0;
+	let selected = 1;
 	const options = [
 		{
 			choice: "disable-main-extension" as const,
@@ -1146,14 +1168,22 @@ function createSharedEntrypointDialog(
 		},
 		{
 			choice: "child-only" as const,
-			title: `僅關閉 ${item.label}`,
+			title: `僅關閉 ${item.label}（建議）`,
 			detail: "保留程式背景運行",
 		},
+		{
+			choice: undefined,
+			title: "取消",
+			detail: "不更新狀態、不寫入 settings.json",
+		},
 	];
-	const siblingLabels = siblings
+	let siblingLabels = siblings
 		.map((sibling) => sibling.item.label)
 		.slice(0, 4)
 		.join(", ");
+	if (siblings.length > 4) {
+		siblingLabels += ` …and ${siblings.length - 4} more`;
+	}
 
 	return {
 		render: (width: number) => {
@@ -1168,10 +1198,10 @@ function createSharedEntrypointDialog(
 					const line = `${marker} ${index + 1}. ${option.title} — ${option.detail}`;
 					return index === selected
 						? theme.bg("selectedBg", theme.fg("accent", theme.bold(line)))
-						: theme.fg("muted", line);
+						: line;
 				}),
 				"",
-				theme.fg("dim", "↑↓/←→ 選擇 · 1/2 直接選 · Enter 確認 · Esc 取消"),
+				theme.fg("dim", "↑↓/←→ 選擇 · 1/2/3 直接選 · Enter 確認 · Esc 取消"),
 			];
 			return lines.map((line) => truncateToWidth(line, width));
 		},
@@ -1198,6 +1228,10 @@ function createSharedEntrypointDialog(
 			}
 			if (matchesKey(data, "2")) {
 				onDone(options[1]?.choice);
+				return;
+			}
+			if (matchesKey(data, "3")) {
+				onDone(undefined);
 				return;
 			}
 			if (matchesKey(data, "enter") || data === " ") {
@@ -1271,7 +1305,7 @@ function createDanglingWarningDialog(
 	const options = [
 		{
 			choice: "apply" as const,
-			title: "只套用目前 toggle",
+			title: "只套用目前 toggle（建議）",
 			detail: "保留列出的 source resources 啟用",
 		},
 		{
@@ -1299,8 +1333,8 @@ function createDanglingWarningDialog(
 					"warning",
 					theme.bold(
 						hasDependency
-							? "⚠ Dangling dependency warning"
-							: "⚠ Dangling reference warning",
+							? "⚠ Dangling dependency 警示"
+							: "⚠ Dangling reference 警示",
 					),
 				),
 				`切換 resource：${toggled.item.label} (${resourceTypeSingular(toggled.resourceType)})`,
@@ -1313,7 +1347,7 @@ function createDanglingWarningDialog(
 					const line = `${marker} ${index + 1}. ${option.title} — ${option.detail}`;
 					return index === selected
 						? theme.bg("selectedBg", theme.fg("accent", theme.bold(line)))
-						: theme.fg("muted", line);
+						: line;
 				}),
 				"",
 				theme.fg("dim", "↑↓/←→ 選擇 · 1/2/3 直接選 · Enter 確認 · Esc 取消"),
@@ -1376,6 +1410,7 @@ function buildSettingItems(
 		width = 80,
 		foldedParentRows = new Set<string>(),
 		searchActive = false,
+		theme,
 	} = options;
 	const meta = new Map<string, SettingItemMeta>();
 	const extensions = inventory.extensions ?? [];
@@ -1418,7 +1453,11 @@ function buildSettingItems(
 		indent = false,
 	) => {
 		const settingId = `${resourceType}:${item.id}`;
-		const description = item.description ? ` — ${item.description}` : "";
+		const descriptionText = item.description ? ` — ${item.description}` : "";
+		const description =
+			theme && descriptionText
+				? theme.fg("dim", descriptionText)
+				: descriptionText;
 		const rawLabel = `${indent ? "  " : ""}${item.label}${description}`;
 		pending.push({
 			settingId,
@@ -1566,18 +1605,23 @@ function buildSettingItems(
 
 function renderTabBar(currentTab: TabType, theme: Theme): string {
 	return TABS.map((tab) => {
-		const label = `${tab.shortcut} ${tab.label.toUpperCase()}`;
+		const label = ` ${tab.shortcut} ${tab.label.toUpperCase()} `;
 		if (tab.type === currentTab) {
-			return theme.fg("accent", theme.bold(theme.underline(`══ ${label} ══`)));
+			return theme.bg("selectedBg", theme.bold(label));
 		}
-		return theme.fg("muted", ` ${label} `);
+		return theme.fg("muted", label);
 	}).join("  ");
 }
 
 async function openSelector(
 	ctx: ExtensionCommandContext,
 	loadedInventory: LoadedInventory,
-): Promise<{ toggles: number; blocked: string[]; fallbackWrites: string[] }> {
+): Promise<{
+	toggles: number;
+	blocked: string[];
+	fallbackWrites: string[];
+	directToggles: string[];
+}> {
 	const initial = await readEnabled(ctx.cwd, loadedInventory.inventory);
 	const currentState = cloneEnabledState(initial);
 	const referenceGraph = buildInventoryReferenceGraph(
@@ -1585,7 +1629,10 @@ async function openSelector(
 	);
 	let currentTab: TabType = "extensions";
 	let lastWidth = 80;
-	const foldedParentRows = new Set<string>();
+	const foldedParentRows = computeWarningParentRowIds(
+		loadedInventory.inventory,
+		currentState,
+	);
 	let searchActive = false;
 	let view = buildSettingItems(
 		loadedInventory.inventory,
@@ -1596,28 +1643,49 @@ async function openSelector(
 
 	if (!view.items.length) {
 		ctx.ui.notify("inventory.json is empty.", "warning");
-		return { toggles: 0, blocked: [], fallbackWrites: [] };
+		return { toggles: 0, blocked: [], fallbackWrites: [], directToggles: [] };
 	}
 
 	let toggles = 0;
+	const directToggleIds = new Set<string>();
 	const blocked: string[] = [];
 	const fallbackWrites: string[] = [];
 	const writeErrors: Error[] = [];
 	let writeQueue = Promise.resolve();
 
 	await ctx.ui.custom<undefined>((tui, theme, _kb, done) => {
+		view = buildSettingItems(
+			loadedInventory.inventory,
+			currentState,
+			currentTab,
+			{ width: lastWidth, foldedParentRows, searchActive, theme },
+		);
 		const container = new Container();
+		const renderDivider = () =>
+			theme.fg("muted", "─".repeat(Math.min(lastWidth, 72)));
+		const renderTitle = () => {
+			const tabLabel =
+				TABS.find((tab) => tab.type === currentTab)?.label ?? "Extensions";
+			const items = loadedInventory.inventory[currentTab] ?? [];
+			const enabledCount = items.filter((item) =>
+				currentState[currentTab].has(item.id),
+			).length;
+			return theme.fg(
+				"accent",
+				theme.bold(`${tabLabel} — ${enabledCount}/${items.length} enabled`),
+			);
+		};
 		const tabBar = new Text(renderTabBar(currentTab, theme), 1, 0);
 		container.addChild(tabBar);
-		container.addChild(new Text(theme.fg("muted", "─".repeat(72)), 1, 0));
-		container.addChild(
-			new Text(theme.fg("accent", theme.bold("Extension Stack")), 1, 0),
-		);
+		const divider = new Text(renderDivider(), 1, 0);
+		container.addChild(divider);
+		const title = new Text(renderTitle(), 1, 0);
+		container.addChild(title);
 		container.addChild(
 			new Text(
 				theme.fg(
 					"muted",
-					"←→/Tab tabs · 1-4 tabs · ↑↓ navigate · Enter/Space toggle/fold · type to search · Esc close",
+					"←→/1-4 tabs · ↑↓ navigate · Enter/Space toggle/fold · type to search · Esc close",
 				),
 				1,
 				0,
@@ -1830,6 +1898,7 @@ async function openSelector(
 					}
 
 					toggles++;
+					directToggleIds.add(m.item.id);
 					rebuildList(settingId);
 					tui.requestRender();
 					writeQueue = writeQueue
@@ -1920,11 +1989,12 @@ async function openSelector(
 				loadedInventory.inventory,
 				currentState,
 				currentTab,
-				{ width: lastWidth, foldedParentRows, searchActive },
+				{ width: lastWidth, foldedParentRows, searchActive, theme },
 			);
 			meta = view.meta;
 			childrenByParent = view.childrenByParent;
 			parentRows = view.parentRows;
+			title.setText(renderTitle());
 			container.removeChild(list);
 			list = createList(view.items, selectedId);
 			container.addChild(list);
@@ -1952,6 +2022,7 @@ async function openSelector(
 			render: (width: number) => {
 				if (width !== lastWidth) {
 					lastWidth = width;
+					divider.setText(renderDivider());
 					if (
 						!sharedEntrypointDialogOpen &&
 						!danglingWarningDialogOpen &&
@@ -2011,7 +2082,12 @@ async function openSelector(
 		);
 	}
 
-	return { toggles, blocked: Array.from(new Set(blocked)), fallbackWrites };
+	return {
+		toggles,
+		blocked: Array.from(new Set(blocked)),
+		fallbackWrites,
+		directToggles: Array.from(directToggleIds),
+	};
 }
 
 function formatStackFooter(
@@ -2019,18 +2095,29 @@ function formatStackFooter(
 	total: number,
 	unmanagedCount: number,
 	danglingCount: number,
+	applied?: { enabled: number; disabled: number },
 ): string {
 	const suffixParts = [
 		unmanagedCount ? `${unmanagedCount} unmanaged` : undefined,
 		danglingCount ? `${danglingCount} dangling` : undefined,
 	].filter((part): part is string => part !== undefined);
 	const suffix = suffixParts.length ? ` (${suffixParts.join(", ")})` : "";
-	return `stack: ${enabled}/${total}${suffix}`;
+	const appliedParts = applied
+		? [
+				applied.enabled ? `+${applied.enabled}` : undefined,
+				applied.disabled ? `−${applied.disabled}` : undefined,
+			].filter((part): part is string => part !== undefined)
+		: [];
+	const appliedSuffix = appliedParts.length
+		? ` (applied ${appliedParts.join(" ")})`
+		: "";
+	return `stack: ${enabled}/${total}${suffix}${appliedSuffix}`;
 }
 
 async function computeFooter(
 	cwd: string,
 	inventory: Inventory,
+	applied?: { enabled: number; disabled: number },
 ): Promise<string> {
 	const [state, unmanaged] = await Promise.all([
 		readEnabled(cwd, inventory),
@@ -2049,7 +2136,13 @@ async function computeFooter(
 		buildInventoryReferenceGraph(inventory),
 		state,
 	);
-	return formatStackFooter(enabled, total, unmanaged.length, dangling.length);
+	return formatStackFooter(
+		enabled,
+		total,
+		unmanaged.length,
+		dangling.length,
+		applied,
+	);
 }
 
 function danglingWarningsForItem(
@@ -2999,6 +3092,7 @@ export type { EnabledState, Inventory, InventoryItem, InventoryReferenceEdge };
 export {
 	buildInventoryReferenceGraph,
 	computeDanglingEdges,
+	computeWarningParentRowIds,
 	formatStackFooter,
 	inferSkillReferencesFromContent,
 	renderTextList,
@@ -3077,10 +3171,8 @@ export default function piStackSwitch(pi: ExtensionAPI) {
 			}
 
 			const before = await readEnabled(ctx.cwd, inventory);
-			const { toggles, blocked, fallbackWrites } = await openSelector(
-				ctx,
-				loadedInventory,
-			);
+			const { toggles, blocked, fallbackWrites, directToggles } =
+				await openSelector(ctx, loadedInventory);
 			const after = await readEnabled(ctx.cwd, inventory);
 			const diff = computeDiff(before, after);
 
@@ -3102,6 +3194,10 @@ export default function piStackSwitch(pi: ExtensionAPI) {
 				return;
 			}
 
+			const directToggleIds = new Set(directToggles);
+			const tandemChanges = [...diff.enabled, ...diff.disabled].filter(
+				(id) => !directToggleIds.has(id),
+			);
 			const summary = [
 				`${toggles} toggle${toggles > 1 ? "s" : ""}, applying…`,
 				diff.enabled.length
@@ -3109,6 +3205,9 @@ export default function piStackSwitch(pi: ExtensionAPI) {
 					: undefined,
 				diff.disabled.length
 					? `  disabled: ${diff.disabled.join(", ")}`
+					: undefined,
+				tandemChanges.length
+					? `  連動: ${tandemChanges.join(", ")}`
 					: undefined,
 				blocked.length ? `  blocked: ${blocked.join(", ")}` : undefined,
 				fallbackWrites.length
@@ -3118,7 +3217,13 @@ export default function piStackSwitch(pi: ExtensionAPI) {
 				.filter(Boolean)
 				.join("\n");
 			ctx.ui.notify(summary, "info");
-			ctx.ui.setStatus(STATUS_KEY, await computeFooter(ctx.cwd, inventory));
+			ctx.ui.setStatus(
+				STATUS_KEY,
+				await computeFooter(ctx.cwd, inventory, {
+					enabled: diff.enabled.length,
+					disabled: diff.disabled.length,
+				}),
+			);
 
 			await new Promise((resolveDone) => setTimeout(resolveDone, 80));
 			await ctx.reload();

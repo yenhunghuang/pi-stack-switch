@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import {
 	buildInventoryReferenceGraph,
 	computeDanglingEdges,
+	computeWarningParentRowIds,
 	type EnabledState,
 	formatStackFooter,
 	type Inventory,
@@ -57,4 +58,32 @@ assert.match(
 assert.equal(
 	formatStackFooter(16, 18, 1, dangling.length),
 	"stack: 16/18 (1 unmanaged, 1 dangling)",
+);
+
+const warningInventory: Inventory = {
+	extensions: [
+		{ id: "pkg-a", label: "Pkg A" },
+		{ id: "pkg-b", label: "Pkg B" },
+	],
+	skills: [
+		{ id: "skill-a", label: "Skill A", source: "pkg-a" },
+		{ id: "skill-b", label: "Skill B", source: "pkg-b" },
+		{ id: "skill-c", label: "Skill C" },
+	],
+};
+const warningState: EnabledState = {
+	extensions: new Set(["pkg-b"]),
+	skills: new Set(["skill-a", "skill-b"]),
+	prompts: new Set(),
+	themes: new Set(),
+};
+const warningRowIds = computeWarningParentRowIds(
+	warningInventory,
+	warningState,
+);
+assert.deepEqual([...warningRowIds], ["parent:skills:pkg-a"]);
+
+assert.equal(
+	formatStackFooter(16, 18, 0, 0, { enabled: 2, disabled: 1 }),
+	"stack: 16/18 (applied +2 −1)",
 );
