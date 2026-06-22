@@ -1,4 +1,25 @@
-import assert from "node:assert/strict";
+const assert = {
+	equal(actual: unknown, expected: unknown) {
+		if (actual !== expected) {
+			throw new Error(`Expected ${String(expected)}, got ${String(actual)}`);
+		}
+	},
+	deepEqual(actual: unknown, expected: unknown) {
+		if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+			throw new Error(
+				`Expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`,
+			);
+		}
+	},
+	match(actual: string, expected: RegExp) {
+		if (!expected.test(actual)) {
+			throw new Error(
+				`Expected ${JSON.stringify(actual)} to match ${expected}`,
+			);
+		}
+	},
+};
+
 import {
 	buildInventoryReferenceGraph,
 	computeDanglingEdges,
@@ -7,8 +28,49 @@ import {
 	formatStackFooter,
 	type Inventory,
 	inferSkillReferencesFromContent,
+	inventoryItemFromUnmanaged,
 	renderTextList,
+	resolveDescription,
 } from "./index";
+
+assert.equal(
+	resolveDescription({ "zh-TW": "使用者確認", en: "Ask user" }),
+	"使用者確認",
+);
+assert.equal(resolveDescription("LSP / ast-grep"), "LSP / ast-grep");
+assert.equal(resolveDescription("   "), "未提供描述");
+assert.equal(resolveDescription(undefined), "未提供描述");
+
+const discoveredWithoutDescription = inventoryItemFromUnmanaged(
+	{
+		key: "package:missing",
+		id: "missing-description",
+		label: "Missing Description",
+		scope: "global",
+		kind: "package",
+		source: "missing-description",
+	},
+	undefined,
+);
+assert.equal(discoveredWithoutDescription.description, undefined);
+assert.equal(
+	resolveDescription(discoveredWithoutDescription.description),
+	"未提供描述",
+);
+
+const discoveredWithDescription = inventoryItemFromUnmanaged(
+	{
+		key: "package:described",
+		id: "described",
+		label: "Described",
+		scope: "global",
+		kind: "package",
+		source: "described",
+		description: { "zh-TW": "已描述" },
+	},
+	undefined,
+);
+assert.deepEqual(discoveredWithDescription.description, { "zh-TW": "已描述" });
 
 const inventory: Inventory = {
 	skills: [
@@ -26,7 +88,7 @@ const inventory: Inventory = {
 };
 
 const usingSuperpowers = inventory.skills?.[0];
-assert.ok(usingSuperpowers);
+if (!usingSuperpowers) throw new Error("missing using-superpowers fixture");
 const inferred = inferSkillReferencesFromContent(
 	usingSuperpowers,
 	"When ideating, Invoke brainstorming skill first.",

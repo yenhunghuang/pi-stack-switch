@@ -5,7 +5,10 @@
 			"id": "taskplane",
 			"label": "Taskplane",
 			"category": "Workflow:Orchestration",
-			"description": "任務編排 /orch"
+			"description": {
+				"zh-TW": "任務編排 /orch",
+				"en": "Task orchestration /orch"
+			}
 		},
 		{
 			"id": "@plannotator/pi-extension",

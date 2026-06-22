@@ -1,3 +1,5 @@
+/// <reference path="./types.d.ts" />
+
 /**
  * pi-stack-switch (multi-select mode)
  * ============================================================================
@@ -41,6 +43,40 @@ type ResourceType = "extensions" | "skills" | "prompts" | "themes";
 type ChildResourceType = Exclude<ResourceType, "extensions">;
 type ResourceReferenceGroups = Partial<Record<ResourceType, string[]>>;
 type ReferenceEdgeKind = "references" | "dependsOn";
+type LocalizedDescription = string | Record<string, string>;
+
+function resolveDescription(
+	description: LocalizedDescription | undefined,
+	locale = "zh-TW",
+): string {
+	if (typeof description === "string") {
+		return description.trim() || "未提供描述";
+	}
+	const localized = description?.[locale]?.trim();
+	if (localized) return localized;
+	return "未提供描述";
+}
+
+function descriptionProvided(
+	description: LocalizedDescription | undefined,
+): boolean {
+	return resolveDescription(description) !== "未提供描述";
+}
+
+function descriptionFromUnknown(
+	value: unknown,
+): LocalizedDescription | undefined {
+	if (typeof value === "string") return value.trim() ? value : undefined;
+	if (!value || typeof value !== "object" || Array.isArray(value))
+		return undefined;
+	const descriptions: Record<string, string> = {};
+	for (const [key, description] of Object.entries(value)) {
+		if (typeof description === "string" && description.trim()) {
+			descriptions[key] = description;
+		}
+	}
+	return Object.keys(descriptions).length ? descriptions : undefined;
+}
 
 const TABS = [
 	{ type: "extensions", label: "Extensions", shortcut: "1" },
@@ -67,7 +103,7 @@ interface InventoryItem {
 	id: string;
 	/** UI label. */
 	label: string;
-	description?: string;
+	description?: LocalizedDescription;
 	category?: string;
 	/** Optional explicit package source/path when id is only a short display id. */
 	source?: string;
@@ -133,6 +169,7 @@ interface UnmanagedExtension {
 	kind: "package" | "top-level";
 	source?: string;
 	path?: string;
+	description?: LocalizedDescription;
 }
 
 interface InventoryReferenceEdge {
@@ -844,6 +881,10 @@ function collectUnmanagedFromPackageList(
 			scope,
 			kind: "package",
 			source,
+			description:
+				typeof pkg === "object"
+					? descriptionFromUnknown(pkg.description)
+					: undefined,
 		});
 	}
 	return entries;
@@ -870,6 +911,21 @@ function collectUnmanagedFromTopLevelExtensions(
 		});
 	}
 	return entries;
+}
+
+async function packageManifestDescription(
+	cwd: string,
+	entry: UnmanagedExtension,
+): Promise<LocalizedDescription | undefined> {
+	const target = unmanagedPackageTarget(entry);
+	if (!target) return undefined;
+	const root = packageRootForTarget(cwd, target);
+	if (!root) return undefined;
+	const manifest = await readJsonSafe<Record<string, unknown>>(
+		join(root, "package.json"),
+		{},
+	);
+	return descriptionFromUnknown(manifest.description);
 }
 
 async function discoverUnmanaged(
@@ -902,11 +958,18 @@ async function discoverUnmanaged(
 		),
 	];
 	const seen = new Set<string>();
-	return discovered.filter((entry) => {
+	const unique = discovered.filter((entry) => {
 		if (seen.has(entry.key)) return false;
 		seen.add(entry.key);
 		return true;
 	});
+	return Promise.all(
+		unique.map(async (entry) => ({
+			...entry,
+			description:
+				entry.description ?? (await packageManifestDescription(cwd, entry)),
+		})),
+	);
 }
 
 interface ApplyToggleOptions {
@@ -1453,17 +1516,18 @@ function buildSettingItems(
 		indent = false,
 	) => {
 		const settingId = `${resourceType}:${item.id}`;
-		const descriptionText = item.description ? ` — ${item.description}` : "";
-		const description =
-			theme && descriptionText
-				? theme.fg("dim", descriptionText)
-				: descriptionText;
+		const resolvedDescription = resolveDescription(item.description);
+		const descriptionText = ` — ${resolvedDescription}`;
+		const description = theme
+			? theme.fg("dim", descriptionText)
+			: descriptionText;
 		const rawLabel = `${indent ? "  " : ""}${item.label}${description}`;
 		pending.push({
 			settingId,
 			rawLabel,
 			currentValue: state[resourceType].has(item.id) ? "on" : "off",
 			values: ["on", "off"],
+			description: resolvedDescription,
 		});
 		meta.set(settingId, { resourceType, item });
 	};
@@ -1488,7 +1552,9 @@ function buildSettingItems(
 				displayLabel =
 					p.rawLabel + " ".repeat(targetWidth - visibleWidth(p.rawLabel));
 			}
-			if (p.description) descriptions.push(p.description);
+			if (p.description && !p.rawLabel.includes(p.description)) {
+				descriptions.push(p.description);
+			}
 
 			return {
 				id: p.settingId,
@@ -1558,7 +1624,8 @@ function buildSettingItems(
 					`${parentItem.label} extension is off. Enable it from Extensions tab.`,
 				);
 			}
-			if (parentItem?.description) descriptions.push(parentItem.description);
+			if (parentItem)
+				descriptions.push(resolveDescription(parentItem.description));
 			if (!parentItem) {
 				descriptions.push(
 					"Standalone resources are not attached to an Extension.",
@@ -2179,7 +2246,7 @@ function renderTextList(inventory: Inventory, state: EnabledState): string {
 				? danglingWarningsForItem(dangling, resourceType, item)
 				: [];
 			const warningSuffix = warnings.length ? ` ${warnings.join("; ")}` : "";
-			const desc = item.description ? `\n      ${item.description}` : "";
+			const desc = `\n      ${resolveDescription(item.description)}`;
 			lines.push(`  ${mark} ${item.label}${category}${warningSuffix}${desc}`);
 		}
 	};
@@ -2285,6 +2352,8 @@ function inventoryItemFromUnmanaged(
 	if (category) item.category = category;
 	if (entry.source && entry.source !== entry.id) item.source = entry.source;
 	if (entry.path) item.path = entry.path;
+	if (descriptionProvided(entry.description))
+		item.description = entry.description;
 	return item;
 }
 
@@ -2806,7 +2875,6 @@ function standaloneResourceItem(
 		id,
 		label: defaultLabelForId(id),
 		category: "Standalone",
-		description: `Discovered standalone ${resourceType.slice(0, -1)}`,
 		path,
 	};
 }
@@ -3095,7 +3163,9 @@ export {
 	computeWarningParentRowIds,
 	formatStackFooter,
 	inferSkillReferencesFromContent,
+	inventoryItemFromUnmanaged,
 	renderTextList,
+	resolveDescription,
 };
 
 export default function piStackSwitch(pi: ExtensionAPI) {
